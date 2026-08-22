@@ -36,7 +36,9 @@ def main():
     print(ctx.to_llm_context())
     print("\n" + "=" * 60 + "\n")
 
-    codebase_context = get_codebase_context_from_github(args.github_owner, args.github_repo, ref=args.github_ref)
+    codebase_context = get_codebase_context_from_github(
+        args.github_owner, args.github_repo, ref=args.github_ref, metric_name=ctx.alarm.metric_name,
+    )
     result = diagnose_incident(ctx, codebase_context=codebase_context)
     print(result.to_text())
 

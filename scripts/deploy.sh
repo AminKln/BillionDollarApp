@@ -7,9 +7,10 @@
 #
 # Requires .env (copy .env.example) with at least ANTHROPIC_API_KEY,
 # ALARM_TOPIC_ARN set. LOG_GROUP is optional (empty = skip log evidence --
-# the app doesn't ship logs yet). GITHUB_* vars are currently unused
-# (get_codebase_context_from_github() is stubbed) but still passed through
-# for whenever either is re-enabled.
+# the app doesn't ship logs yet). GITHUB_OWNER/GITHUB_REPO identify the
+# *target app's* repo (e.g. Tehreem404/bad_app_demo) that
+# get_codebase_context_from_github() fetches live on every alarm --
+# required for real codebase context, not just optional plumbing.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

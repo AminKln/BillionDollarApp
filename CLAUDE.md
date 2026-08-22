@@ -4,156 +4,172 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project summary
 
-A hackathon project (AWS + GenAI, Ottawa 2026, Team 06): watches an app's
-latency/error metrics and host system load, detects anomalies via
-CloudWatch's built-in ML anomaly detection, and — when one fires — pulls
-context (a git diff and/or CloudWatch logs) and sends it to an LLM for
-root-cause diagnosis and a suggested fix. Full design rationale, free-tier
-accounting, and build order are in `docs/architecture.md`; demo timing/talk
-track is in `docs/demo-script.md`.
+A hackathon project (AWS + GenAI, Ottawa 2026, Team 06): a real CloudWatch
+anomaly-detection alarm on a demo app fires -> an SNS-triggered Lambda
+gathers real alarm/metric evidence plus the app's real codebase -> both go
+into one prompt sent to Claude for a grounded root-cause diagnosis. The demo
+app itself lives in a **separate repo**
+([`Tehreem404/bad_app_demo`](https://github.com/Tehreem404/bad_app_demo)),
+not this one — this repo only reacts to what that app's alarm publishes.
 
-## Two coexisting pipeline implementations
+This is `feature/LLM_diagnosis_complete` — the merge of two branches built
+in parallel:
+- `feature/LLM_diagnosis` -> `agent/`: the actual SNS-triggered, deployed
+  Lambda pipeline (stack `anomaly-review-agent`).
+- `feature/LLM_diagnosis_context` -> `pipeline/`: a standalone context
+  builder + `diagnose()` library call, developed and tested independently.
 
-The repo contains **two separate, non-integrated implementations** of
-"anomaly → LLM diagnosis." Don't assume one supersedes the other without
-checking git history/branch — neither doc set (`README.md`/
-`docs/architecture.md`) has been updated to describe the second one.
+The integration work this merge did: `agent/`'s codebase-context step
+(`agent/github_context.py`) was a placeholder stub; `pipeline/`'s
+`code_context.py` had already proven "dump the whole current codebase"
+as the design. `agent/github_context.py` now has a real implementation of
+that same idea, rebuilt against the GitHub REST API instead of a local
+`git clone`, because the Lambda runtime `agent/` deploys into has no `git`
+binary. **`docs/current-pipeline.md` is the authoritative, up-to-date
+architecture doc — read it before `docs/architecture.md`, which describes
+the original (now superseded) Bedrock/`lambda/`-based plan.**
 
-**1. `lambda/` — the documented, SAM-deployed pipeline** (matches
-`README.md`, `docs/architecture.md`, `template.yaml`):
-- `lambda/handler.py` — entry point, handles both SNS-alarm invocations and
-  CloudWatch custom-widget render invocations in one Lambda.
-- `lambda/git_context.py` — GitHub REST API: finds the last commit before
-  the alarm fired, fetches the diff since then (dependency-free, plain
-  `urllib`, no `requests`, so no Lambda build step is needed). Operates on
-  *this* repo (the demo app lives in-repo under `infra/demo-app/`).
-- `lambda/llm_review.py` — calls **Bedrock** (`bedrock-runtime.invoke_model`)
-  with the diff, gets back diagnosis + suggested fix as JSON matching
-  `docs/contracts/review-result.json`.
-- `lambda/notify.py` — publishes the verdict to an SNS email topic, and
-  persists the "latest verdict" as this same Lambda's own environment
-  variable (via `lambda:UpdateFunctionConfiguration`) so the CloudWatch
-  custom-widget render path can read it back with no database. This is a
-  deliberate single-slot, eventually-consistent store — not a real
-  datastore (DynamoDB/S3 were dropped from the MVP, see
-  `docs/architecture.md` §2/§7).
-- Deployed via SAM (`template.yaml`, `scripts/deploy.sh`).
+## `agent/` vs `pipeline/` — two implementations, same design, different jobs
 
-**2. `pipeline/` — a standalone context-builder + LLM diagnosis, not
-Lambda-deployed, no docs update yet:**
-- `pipeline/diagnose.py` — **the integration point for the anomaly-detection
-  side.** `diagnose(event) -> str` wraps everything below into one call:
-  give it whatever the detector produces (alarm name, alarm-message dict,
-  raw SNS envelope, or a JSON string of one) and it returns Claude's full
-  diagnosis as text. Defaults `GIT_REPO_PATH`/`INSTANCE_ID`/`AWS_REGION` to
-  this project's fixed demo target so the caller only needs
-  `ANTHROPIC_API_KEY` set — no other config required. Bootstraps its own
-  `sys.path` so it resolves correctly when imported from any directory
-  (verified via `importlib` from an unrelated directory with nothing else
-  on the path).
-- `pipeline/cloudwatch_context.py` — real CloudWatch alarm definition
-  (handles both classic-threshold and metric-math/anomaly-detection alarm
-  shapes), metric datapoints around the trigger, EC2 instance metadata
-  (via `INSTANCE_ID` env var — this project's alarms dimension on `App`,
-  not `InstanceId`, so it isn't inferred from the alarm), and log lines if
-  `LOG_GROUP` is set. Every field that can't be fetched carries an explicit
-  note instead of being silently omitted or faked.
-- `pipeline/code_context.py` — pulls the **entire current source tree**
-  (every tracked, non-binary file, in full via local `git`/subprocess, not
-  the GitHub API or a diff) from **a different, external repo**
-  ([`Tehreem404/bad_app_demo`](https://github.com/Tehreem404/bad_app_demo),
-  set via `GIT_REPO_PATH` — a local checkout or a clone URL), plus a
-  one-line "as of commit X" freshness note. Deliberately whole-codebase, not
-  commit diffs — the full current code was judged more useful for diagnosis
-  than PR/commit-level history. Files are ranked by relevance to the
-  alarm's metric name only for trimming order if the codebase exceeds the
-  40k-char prompt budget (`MAX_TOTAL_CODE_CHARS`), not for filtering.
-- `pipeline/build_prompt.py` — combines both into one natural-language
-  prompt string (`build_diagnosis_prompt()`), meant to be dropped straight
-  into a **direct Anthropic API** `messages.create()` call. Does not call
-  the LLM itself.
-- Not deployed anywhere — no `template.yaml` resource references it; run
-  locally or adapt into a Lambda handler as needed.
+**`agent/` — the real, deployed, SNS-triggered pipeline.** This folder
+*is* `template.yaml`'s Lambda `CodeUri` (no build/staging step):
+- `agent/handler.py` — `lambda_handler(event, context)`, SNS entry point.
+  Parses `event.Records[*].Sns.Message`, ignores anything where
+  `NewStateValue != "ALARM"`, calls `_handle_alarm()`.
+- `agent/context_builder.py` — real CloudWatch alarm/metric/log evidence
+  (`boto3`). Handles both classic-threshold and metric-math/anomaly-band
+  alarm shapes (`describe_alarms`'s response shape differs between them —
+  see the note in `get_alarm_details()`). Log evidence is skipped (not
+  faked) when `LOG_GROUP` is unset — no log group exists for the demo app
+  yet.
+- `agent/github_context.py` — `get_codebase_context_from_github(owner,
+  repo, ref, metric_name)`: real fetch of the **target app's** entire
+  current source tree via the GitHub REST API (`git/trees` + `git/blobs`),
+  ranked by relevance to `metric_name` when it exceeds a 40k-char budget.
+  `owner`/`repo` point at `bad_app_demo`, not this repo.
+- `agent/llm_agent.py` — `diagnose_incident()`: one Claude call
+  (`claude-sonnet-5`), **forced tool use** (`report_root_cause`) so the
+  result is always structured (`hypothesis`/`confidence`/
+  `supporting_evidence`/`suggested_action`), never free-text-JSON-and-hope.
+  `max_tokens=1024` — confirmed *not* to hit the empty-response failure
+  mode adaptive thinking can cause on `claude-sonnet-5` at a low cap (see
+  `pipeline/`'s note below); that failure mode was only observed on
+  free-text (no forced tool) calls.
+- `agent/run_manual.py` + `agent/fake_alert.py` + `agent/fixtures.py` — CLI
+  entry point against a **fake** alert (canned CloudWatch data via
+  `botocore.stub.Stubber`, two scenarios), still calls the real
+  `github_context`/`llm_agent` — `./scripts/run_manual.sh [--scenario
+  db_timeout|ambiguous_5xx]`.
+- `agent/codebase_context.md` — leftover from the original stub design
+  (fetch-one-file-from-this-repo). No longer read by anything;
+  `github_context.py` now fetches the target app's whole repo instead.
+  Left in place, flagged rather than deleted.
+- Deployed via SAM (`template.yaml`, `scripts/deploy.sh`), stack
+  `anomaly-review-agent`, subscribed to the real `culprit-alerts` SNS topic.
 
-When editing "the LLM step" or "the anomaly pipeline," check which of
-these two the user means — they target different app repos (this repo's
-`infra/demo-app/` vs. the external `bad_app_demo`), use different LLM
-providers (Bedrock vs. direct Anthropic API), and different git sourcing
-(GitHub API diff-since-last-good-commit vs. a full local-checkout codebase
-dump with no diff/commit history beyond a one-line freshness note).
+**`pipeline/` — standalone, not Lambda-deployed, for local/manual use and
+as a library.** See `pipeline/README.md` for full usage.
+- `pipeline/diagnose.py` — **the one-call integration point** for calling
+  this from outside a Lambda: `diagnose(event) -> str`. Give it whatever an
+  external detector has (alarm name / alarm-message dict / raw SNS
+  envelope), it returns Claude's diagnosis as free text (not the structured
+  `agent/llm_agent.py` shape). Defaults `GIT_REPO_PATH`/`INSTANCE_ID`/
+  `AWS_REGION` to this project's demo target so only `ANTHROPIC_API_KEY` is
+  required. Bootstraps its own `sys.path`, so it resolves correctly when
+  imported from any directory.
+- `pipeline/cloudwatch_context.py` — CloudWatch evidence, same design as
+  `agent/context_builder.py` (independently built, same anomaly-band-alarm
+  handling). Also honors an SNS message's own `NewStateValue`/
+  `StateChangeTime` over the alarm's live (possibly since-changed) state —
+  `agent/context_builder.py` does not do this yet.
+- `pipeline/code_context.py` — same "whole current codebase, not a diff"
+  design as `agent/github_context.py`, but via a **local `git clone`**
+  instead of the GitHub API (fine here since this doesn't run in Lambda).
+  Keep the skip-list/budget/relevance logic in sync between the two if
+  either changes.
+- `pipeline/build_prompt.py` — assembles both into one prompt string
+  (`build_diagnosis_prompt()`); doesn't call an LLM itself.
+- Verified: `claude-sonnet-5` free-text (no forced tool) calls can spend an
+  entire low `max_tokens` budget on adaptive thinking and return **empty**
+  text — fixed by using `max_tokens=16000`. This is a real, previously-hit
+  failure mode, not a hypothetical.
+
+**When editing "the LLM step" or "the anomaly pipeline," check which of
+these two the user means.** Same target app, same "full codebase, not
+diff" design, same Claude model — but different output shape (structured
+tool-use vs. free text), different codebase-fetch mechanism (GitHub API vs.
+local git), and only `agent/` is actually wired to fire automatically.
 
 ## Running things
 
 There is no test suite or linter in this repo. Dependency manifests:
-`lambda/requirements.txt` (deliberately near-empty — `boto3` ships with the
-Lambda runtime), `infra/demo-app/requirements.txt` (`flask`, `boto3`), and
-`pipeline/requirements.txt` (`boto3`, `anthropic`).
+`agent/requirements.txt` (just `anthropic` — `boto3` ships with the Lambda
+runtime) and `pipeline/requirements.txt` (`boto3`, `anthropic`).
 
-**Get a real diagnosis from `pipeline/` (needs real AWS creds +
-`ANTHROPIC_API_KEY`; everything else defaults to this project's demo
-target):**
+**Get a real diagnosis via `pipeline/` (local, no deploy; needs real AWS
+creds + `ANTHROPIC_API_KEY`; everything else defaults to this project's
+demo target):**
 ```bash
 pip install -r pipeline/requirements.txt
 cd pipeline
 ANTHROPIC_API_KEY=... python3 diagnose.py <alarm_name_or_path_to_sns_message.json>
 ```
-Or as a library call — this is the integration point for whoever builds the
-anomaly-detection side: `from diagnose import diagnose; diagnose(event)`.
+Or as a library call: `from diagnose import diagnose; diagnose(event)`.
 
-See `pipeline/README.md` for the full env var list and a real sample of the
-assembled prompt. `build_prompt.py`/`build_diagnosis_prompt()` alone only
-builds the prompt string without calling Claude, per the module docstring in
-`pipeline/build_prompt.py`.
+**Test the real, deployed `agent/` pipeline's logic locally without SNS**
+(needs real AWS creds + `ANTHROPIC_API_KEY`; set `GITHUB_OWNER=Tehreem404
+GITHUB_REPO=bad_app_demo` first):
+```python
+import handler
+handler._handle_alarm({"AlarmName": "culprit-App-Anomaly", "NewStateValue": "ALARM", "NewStateReason": "..."})
+```
 
-**Deploy the SAM-based `lambda/` pipeline:**
+**Run `agent/` against a fake alert** (no AWS creds needed for the
+CloudWatch side, but still makes a real GitHub + Claude call):
 ```bash
-cp .env.example .env   # fill in GITHUB_TOKEN, GITHUB_OWNER, GITHUB_REPO, NOTIFY_EMAIL
+./scripts/run_manual.sh --scenario db_timeout   # or ambiguous_5xx
+```
+
+**Deploy/redeploy the SAM-based `agent/` pipeline:**
+```bash
+cp .env.example .env   # fill in ANTHROPIC_API_KEY, ALARM_TOPIC_ARN, GITHUB_OWNER=Tehreem404, GITHUB_REPO=bad_app_demo
 ./scripts/deploy.sh    # wraps: sam build && sam deploy --parameter-overrides ...
 ```
-Confirm the `BedrockModelId` parameter in `template.yaml` against actual
-granted Bedrock access before deploying — it's a placeholder
-(`anthropic.claude-3-5-sonnet-20241022-v2:0`).
-
-**Demo helpers for the `lambda/` pipeline:**
-```bash
-./scripts/trigger_chaos.sh latency on|off   # flips infra/demo-app/bad_app.py chaos toggles
-./scripts/trigger_chaos.sh errors on|off    # DEMO_APP_HOST env var to target a non-localhost app
-./scripts/seed_bad_commit.sh "<message>"    # commits+pushes the pre-staged bad change in bad_app.py
-```
+As of this branch's merge, this has **not yet been redeployed** — the live
+`anomaly-review-agent-review` function still runs the old placeholder
+codebase-context stub until this is run again.
 
 ## Key architectural facts worth knowing before editing
 
-- **One Lambda, two invocation shapes.** `lambda/handler.py` is invoked
-  both by SNS (real alarm) and directly by CloudWatch (custom-widget
-  render, `event["widgetContext"]`) — same function, branch at the top of
-  `lambda_handler()`. Don't split this into two functions without updating
-  `template.yaml`'s `DashboardWidgetInvokePermission` and the self-referencing
-  `PersistLastVerdict` IAM policy (which hardcodes the function name via
-  `${AWS::StackName}-review`).
-- **Anomaly detection, not threshold alarms.** `template.yaml`'s
-  `RequestLatencyAnomalyAlarm` uses a metric-math `ANOMALY_DETECTION_BAND`
-  expression as `ThresholdMetricId`, not a hand-set number — this replaced
-  an earlier Prometheus/Alertmanager design (see `docs/architecture.md` §2
-  for the full "what changed and why").
-- **CloudWatch's ~1 minute metric resolution + `EvaluationPeriods: 2`**
-  means at least 2–3 minutes between triggering chaos and the alarm firing.
-  This governs demo pacing (`docs/demo-script.md`) and is relevant to
-  anything timing-sensitive.
-- **`OK` state transitions also invoke the Lambda** (alarm actions fire on
-  both `AlarmActions` and `OKActions`) — `_handle_alarm()` in
-  `lambda/handler.py` explicitly ignores anything but `NewStateValue ==
+- **This repo doesn't own the alarm or the app.** Both live in the
+  separate `bad_app_demo` repo/EC2 instance. `template.yaml`'s
+  `AlarmTopicArn` parameter subscribes to an **existing** SNS topic
+  (`culprit-alerts`) rather than creating one — see `docs/current-pipeline.md`
+  §7 for the full list of what changed from the original all-in-one-repo
+  design and why.
+- **`OK` state transitions also invoke the Lambda** (CloudWatch alarm
+  actions fire on both `ALARM` and `OK` transitions) — `_handle_alarm()` in
+  `agent/handler.py` explicitly ignores anything but `NewStateValue ==
   "ALARM"`. Don't remove that check.
-- **Diff truncation cap:** `lambda/git_context.py` caps diffs at ~24k chars
-  (`MAX_DIFF_CHARS`) before handing them to the LLM.
+- **Anomaly-band alarms need special parsing.** `culprit-App-Anomaly` is a
+  metric-math (`ANOMALY_DETECTION_BAND`) alarm — `describe_alarms`'s
+  response omits top-level `Namespace`/`MetricName`/`Threshold` for these
+  and nests them in a `Metrics[]` array instead, with no fixed threshold
+  (the band is dynamic). Both `agent/context_builder.py`'s
+  `get_alarm_details()` and `pipeline/cloudwatch_context.py`'s
+  `get_alarm_definition()` handle this — don't regress either back to
+  assuming the simple/classic alarm shape.
+- **No `git` binary in Lambda.** `agent/github_context.py` fetches the
+  target repo entirely through the GitHub REST API (trees + blobs) for
+  exactly this reason — don't "simplify" it to a `git clone` without adding
+  a Lambda layer that bundles `git`, or it'll fail at runtime.
 - **Data contracts live in `docs/contracts/`** — `alarm-sns-message.json`
-  (what `lambda/handler.py` receives; `pipeline/cloudwatch_context.py`
-  parses the same shape via `parse_alarm_message()`) and
-  `review-result.json` (what `lambda/llm_review.py` returns / what
-  `notify.py` renders — `pipeline/` doesn't produce this shape, it only
-  builds the prompt, not a parsed verdict).
-- **Secrets:** `.env` (gitignored) holds `GITHUB_TOKEN`, `GITHUB_OWNER`,
-  `GITHUB_REPO`, `NOTIFY_EMAIL` for the `lambda/` pipeline; `deploy.sh`
-  sources it and passes values through as `sam deploy
-  --parameter-overrides`, never into `samconfig.toml`. `ANTHROPIC_API_KEY`
-  (for sending `pipeline/`'s prompt to Claude) is expected as a bare
-  environment variable, not currently listed in `.env.example`.
+  (what `agent/handler.py` and `pipeline/cloudwatch_context.py`'s
+  `parse_alarm_message()` both parse) and `review-result.json` (the shape
+  `agent/llm_agent.py`'s forced tool-use call returns — `pipeline/` doesn't
+  produce this shape, it returns free text).
+- **Secrets:** `.env` (gitignored) holds `ANTHROPIC_API_KEY`,
+  `ALARM_TOPIC_ARN`, `GITHUB_OWNER`/`GITHUB_REPO`/`GITHUB_REF`/
+  `GITHUB_TOKEN` (target app's repo, not this one), `LOG_GROUP` (optional).
+  `deploy.sh` sources it and passes values through as `sam deploy
+  --parameter-overrides`, never into `samconfig.toml`.

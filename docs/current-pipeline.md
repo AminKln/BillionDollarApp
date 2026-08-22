@@ -1,29 +1,31 @@
-# Current pipeline (`feature/LLM_diagnosis` branch)
+# Current pipeline (`feature/LLM_diagnosis_complete` branch)
 
-> Written to support merging in a branch that reintroduces git-context
-> (diff) correlation. This documents what's actually deployed and running
-> today, how it differs from the original plan in
-> [architecture.md](architecture.md), and exactly where a git-context step
-> would plug back in. `architecture.md` describes the *original* hackathon
-> design (Bedrock, git-diff correlation, notify/dashboard-widget) and is
-> **not** current — this document supersedes it for anything it disagrees on.
+> Merges `feature/LLM_diagnosis` (this file's original branch — the
+> deployed SNS→Lambda trigger, `agent/`) with `feature/LLM_diagnosis_context`
+> (`pipeline/` — a real, full-codebase context builder, tested standalone).
+> The merge's actual integration work: `agent/github_context.py`'s
+> `get_codebase_context_from_github()` stub is now a real implementation —
+> see §5. `architecture.md` describes the *original* hackathon design
+> (Bedrock, git-diff correlation, notify/dashboard-widget) and is **not**
+> current — this document supersedes it for anything it disagrees on.
 
 ## TL;DR
 
 A CloudWatch alarm (owned in a separate repo, not this one) publishes to an
 SNS topic. A Lambda subscribed to that topic gathers real alarm/metric/log
-evidence via `boto3`, combines it with a codebase-context string into one
-prompt, and sends it to Claude via the direct Anthropic API for a grounded
-root-cause hypothesis. The verdict is logged and returned as the Lambda's
-invocation result — there is no notification, dashboard widget, or git-diff
-step in this branch; all three existed in the original design and were
-deliberately removed for a simpler MVP. **Diff correlation is the main gap
-this branch left for a git-context branch to fill in** — see §6.
+evidence via `boto3`, fetches the target app's **entire current codebase**
+live from GitHub, combines both into one prompt, and sends it to Claude via
+the direct Anthropic API for a grounded root-cause hypothesis. The verdict
+is logged and returned as the Lambda's invocation result — there is no
+notification or dashboard-widget step; both existed in the original design
+and were deliberately removed for a simpler MVP.
 
 Deployed and **verified against real AWS data** (not just fixtures) as of
 this writing: stack `anomaly-review-agent`, region `us-east-1`, subscribed
 to the real `culprit-alerts` SNS topic behind the real `culprit-App-Anomaly`
-alarm.
+alarm. The codebase-context fetch is verified against the real target repo
+([`Tehreem404/bad_app_demo`](https://github.com/Tehreem404/bad_app_demo)) —
+see §5.
 
 ## 1. Request flow
 
@@ -46,9 +48,10 @@ _handle_alarm(alarm)
     │                                   if log_group is falsy (see §5)
     │       returns an IncidentContext
     │
-    ├─▶ github_context.get_codebase_context_from_github(owner, repo, ref)
-    │       currently STUBBED -- returns a fixed placeholder string, no
-    │       network call (see §5)
+    ├─▶ github_context.get_codebase_context_from_github(owner, repo, ref, metric_name)
+    │       real GitHub API fetch (git/trees + git/blobs) of the target
+    │       repo's entire current source tree, in full up to a 40k-char
+    │       budget, ranked by relevance to the alarm's metric (see §5)
     │
     └─▶ llm_agent.diagnose_incident(ctx, codebase_context)
             ├─ ctx.to_llm_context() renders the alarm/metric/log digest
@@ -81,9 +84,9 @@ build/staging step, what's in this folder is exactly what gets deployed.
 | `context_builder.py` | Data model (`AlarmDetails`, `MetricAnomaly`, `LogEvidence`, `IncidentContext`) + real `boto3` collectors + `build_incident_context()` orchestrator. |
 | `fixtures.py` | Canned `describe_alarms`/`get_metric_statistics`/Logs-Insights responses (via `botocore.stub.Stubber`) for two scenarios: `db_timeout`, `ambiguous_5xx`. |
 | `fake_alert.py` | `build_fake_incident(scenario_name)` — runs the *real* collector functions in `context_builder.py` against the stubbed clients from `fixtures.py`. Used only by `run_manual.py`. |
-| `github_context.py` | `get_codebase_context_from_github(owner, repo, path, ref)` — currently a stub (see §5). The real, already-tested implementation is preserved as `_fetch_from_github()` in the same file. |
+| `github_context.py` | `get_codebase_context_from_github(owner, repo, ref, metric_name)` — real implementation (see §5): fetches the target repo's entire current source tree via the GitHub REST API (`git/trees` + `git/blobs`, no `git` binary needed — Lambda doesn't have one), ranked by relevance to `metric_name` when the codebase exceeds the char budget. |
 | `llm_agent.py` | `diagnose_incident(context, codebase_context="", client=None)` — builds the prompt, calls Claude, parses the structured response. This is the single point where all context sources get combined into one prompt (§4 explains exactly where). |
-| `codebase_context.md` | Hand-maintained architecture/failure-pattern summary. This is the file `github_context.py` would fetch live from GitHub once un-stubbed (`agent/codebase_context.md` is the default `path`). |
+| `codebase_context.md` | Hand-maintained placeholder from the original stub design (fetch-one-file-from-this-repo). No longer read by `github_context.py`, which now fetches the *target app's* entire repo instead of one hand-maintained summary file. Left in place, unused — flagged rather than deleted since another branch may still reference it. |
 | `requirements.txt` | Just `anthropic` — `boto3` ships with the Lambda runtime. |
 
 ## 3. Data contracts
@@ -113,81 +116,80 @@ Two strings get concatenated into one `user` message: `context.to_llm_context()`
 passed as `codebase_context`. **This is the seam a git-diff context source
 would plug into** — see §6.
 
-## 5. Current stubs (deliberate, for deploy speed)
+## 5. Codebase context: real, full-tree, GitHub-API-based (no `git` binary)
 
-Both were stubbed out specifically to unblock a real deploy without waiting
-on external setup — real implementations exist and are one change away:
+`agent/github_context.py`'s `get_codebase_context_from_github(owner, repo,
+ref=None, metric_name=None)` is a real implementation as of this branch —
+no more placeholder string. It fetches the **entire current source tree**
+of the target app's repo (not one hand-maintained file, and not a diff —
+see "Why full codebase instead of diff correlation" below), all via the
+GitHub REST API:
 
-- **Codebase context** (`agent/github_context.py`) — `get_codebase_context_from_github()`
-  currently returns a fixed placeholder string, no network call. The real
-  implementation (live GitHub Contents API fetch, already tested against
-  the real repo) is preserved as `_fetch_from_github()` in the same file —
-  swap the stub's body to call it to re-enable.
-- **Log evidence** (`agent/context_builder.py`) — `build_incident_context()`
-  skips the Logs Insights query entirely when `log_group` is falsy;
-  `IncidentContext.logs` is `Optional[LogEvidence]`, and `to_llm_context()`
-  renders `"LOG EVIDENCE: not available..."` instead of fabricating data.
-  Re-enables itself automatically the moment `LOG_GROUP` is set to a real
-  log group — no code change needed, just a `template.yaml` parameter.
+1. `GET /repos/{owner}/{repo}/commits?sha={ref}&per_page=1` — latest commit
+   (sha/author/date/message), rendered as a one-line freshness note.
+2. `GET /repos/{owner}/{repo}/git/trees/{commit_sha}?recursive=1` — every
+   file path in the repo at that commit.
+3. `GET /repos/{owner}/{repo}/git/blobs/{blob_sha}` per non-binary,
+   non-skipped file (images/locks/binaries filtered by extension/basename;
+   binary detection is a null-byte/UTF-8-decode check on the blob content)
+   — each file's full text.
+4. Files are ranked by relevance to `metric_name` (same keyword-hint
+   scoring as `pipeline/code_context.py`) and kept in full/truncated/omitted
+   in that order if the total exceeds `MAX_TOTAL_CODE_CHARS` (40,000).
 
-Both stubs mean the current live verdict quality is lower than it will be
-once real codebase context and log evidence are wired back in — confidence
-has been observed dropping to `"low"`/`"medium"` accordingly, which is the
-system prompt working as intended (it's instructed not to fabricate).
+Deliberately API-based rather than a local `git clone`: **the Lambda
+runtime this deploys into has no `git` binary and no guaranteed writable
+disk to clone into.** `pipeline/code_context.py` (this repo's standalone,
+non-Lambda tool — see `pipeline/README.md`) does the equivalent thing via a
+local `git clone` since it doesn't run inside Lambda; keep the two in sync
+if the skip-list/budget/relevance logic changes in either.
 
-## 6. Where git-context (diff) correlation should plug in
+Verified against the real target repo
+([`Tehreem404/bad_app_demo`](https://github.com/Tehreem404/bad_app_demo))
+and the full `_handle_alarm()` path end to end (real alarm, real metric
+data, real codebase fetch, real Claude call) — see §8.
 
-The **original** design (`architecture.md` §5) had `lambda/git_context.py`
-find the last commit before the alarm's timestamp and fetch the diff since
-then via the GitHub API, then feed that diff into the Bedrock prompt. **This
-branch removed that step entirely** — there is currently no diff/commit
-context anywhere in the prompt. To merge it back in:
+**Log evidence** (`agent/context_builder.py`) is still the one remaining
+stub: `build_incident_context()` skips the Logs Insights query entirely
+when `log_group` is falsy; `IncidentContext.logs` is `Optional[LogEvidence]`,
+and `to_llm_context()` renders `"LOG EVIDENCE: not available..."` instead of
+fabricating data. Re-enables itself automatically the moment `LOG_GROUP` is
+set to a real log group — no code change needed, just a `template.yaml`
+parameter. (No log group exists for the target app as of this writing.)
 
-1. **New module**, e.g. `agent/git_context.py` (naming/shape can follow the
-   old `lambda/git_context.py` almost exactly — `get_commit_diff(owner, repo, until_timestamp)`
-   returning `{good_commit_sha, commits, diff, diff_truncated}`). It's
-   dependency-free `urllib.request` + `GITHUB_TOKEN` bearer auth, same
-   pattern as `github_context.py`'s `_fetch_from_github()` — reuse that
-   pattern rather than adding a new HTTP client dependency.
-2. **Wire it into `diagnose_incident()`'s prompt assembly** (§4) — either
-   add a third parameter (`diff_context: str = ""`) alongside
-   `codebase_context` and prepend/append it the same way, or fold it into
-   `IncidentContext` itself as a new optional field (`IncidentContext.diff`)
-   and render it inside `to_llm_context()`, following the same `Optional[...]`
-   pattern already used for `logs` (§5) — recommended, since it's evidence
-   *about the incident*, conceptually closer to alarm/metric/log evidence
-   than to the static codebase-context summary.
-3. **Wire it into `handler.py`'s `_handle_alarm()`** — call the new function
-   with `alarm.get("StateChangeTime")` as the timestamp (present in every
-   real alarm message per `docs/contracts/alarm-sns-message.json`, just
-   currently unread) and the same `GITHUB_OWNER`/`GITHUB_REPO`/`GITHUB_TOKEN`
-   env vars `github_context.py` already uses — no new config plumbing
-   needed, `template.yaml` already has all three as parameters (currently
-   passed through unused since the codebase-context fetch is stubbed).
-4. **Update `SYSTEM_PROMPT`** in `llm_agent.py` to tell the model a diff is
-   now one of its evidence sources and how to weigh it relative to the
-   CloudWatch evidence (the existing prompt's "CloudWatch evidence is the
-   primary basis... codebase context is background" framing is the pattern
-   to extend, not replace).
-5. **`docs/contracts/review-result.json`** may need a `suspect_commit`-style
-   field added back if the diagnosis should name a specific commit — current
-   schema has no field for that (removed along with the Bedrock/diff design).
+## 6. Why full codebase instead of diff correlation
 
-None of this requires touching `context_builder.py`'s CloudWatch collectors
-or `github_context.py`'s codebase-context fetch — they're independent
-context sources that happen to converge in the same prompt-building
-function.
+The **original** design (`architecture.md` §5, and this doc's previous
+revision on `feature/LLM_diagnosis` before this merge) planned a
+`git_context`-style module: find the commit before the alarm fired, fetch
+the diff since then via the GitHub API, feed *that* into the prompt as the
+"what changed" signal — mirroring `lambda/git_context.py`'s approach on the
+original Bedrock-based branch.
+
+That plan was superseded, not built: `pipeline/code_context.py` (built on
+`feature/LLM_diagnosis_context`, merged into this branch) was deliberately
+redirected mid-build from diff-based to whole-codebase-based context — the
+call was that the current state of a small app's code is more directly
+useful for root-cause diagnosis than a diff against an arbitrary prior
+commit, especially for a codebase this size (the target app is a handful of
+files). `agent/github_context.py`'s real implementation (§5) carries that
+same decision forward into the deployed pipeline. A diff-based module could
+still be added later as a *third*, independent context source (same seam
+described in §4 — nothing about the codebase-context or log-evidence
+collectors would need to change), but it's no longer a documented gap this
+branch is waiting on.
 
 ## 7. What changed from the original design, and why
 
 | Original (`architecture.md`) | Current (this branch) | Why |
 |---|---|---|
 | Amazon Bedrock `InvokeModel` | Direct Anthropic API (`agent/llm_agent.py`) | Bedrock model access request was an external blocking dependency with no guaranteed turnaround; direct API was already proven working and unblocked an MVP faster. |
-| `lambda/git_context.py` — diff correlation | **Removed** | Simplification decision; this is the gap §6 addresses. |
+| `lambda/git_context.py` — diff correlation | **Not built** (superseded by full-codebase context, §6) | Simplification decision, then superseded rather than revisited — see §6 for why full-codebase won over diff. |
 | `lambda/notify.py` — SNS email + CloudWatch custom widget | **Removed** | Scoped down to "just react and log the verdict" — email/dashboard-widget were judged unnecessary complexity for the core loop. |
 | `lambda/`, `LLM/`, `cloudWatch/` — three folders, hand-copied duplicates staged into `lambda/` at build time | Single `agent/` folder — Lambda's `CodeUri` *is* the source, no staging | Eliminates drift risk between "what you edit" and "what deploys" entirely, by construction. |
 | This repo creates its own `AWS::CloudWatch::AnomalyDetector` + `Alarm` + SNS topic | Subscribes to an **existing**, externally-managed alarm (`culprit-App-Anomaly`) and topic (`culprit-alerts`) via a `AlarmTopicArn` parameter | The real app/alarm turned out to already exist (built in a separate repo), so this stack no longer owns alarm creation — just reaction. |
 | `infra/demo-app/`, `infra/cloudwatch-agent/`, `scripts/trigger_chaos.sh`, `scripts/seed_bad_commit.sh` | **Removed** | Not connected to the actual running app (which lives in a different repo) — dead scaffolding. |
+| `github_context.py`'s placeholder-string stub | Real GitHub-API fetch of the target repo's **entire current source tree** (§5) | This branch's merge: `pipeline/code_context.py` (built on `feature/LLM_diagnosis_context`) proved the "dump the whole codebase" approach; reimplemented here against the GitHub API since Lambda has no `git` binary. |
 
 ## 8. Verified vs. not-yet-verified
 
@@ -199,13 +201,35 @@ function.
   `MetricName`/`Threshold` entirely (they're nested in a `Metrics[]` array
   instead) — `get_alarm_details()` now handles both the simple-alarm and
   metric-math-alarm response shapes.
+- ✅ **(This branch)** Codebase-context fetch tested against the real target
+  repo (`Tehreem404/bad_app_demo`) — correct file tree, correct relevance
+  ranking (`app.py`, which actually implements the latency behavior, ranked
+  above `Dockerfile`/CI workflow), correct freshness note, no README
+  false-positive when none exists.
+- ✅ **(This branch)** Full `_handle_alarm()` path re-verified end to end
+  with the real codebase context wired in (previously it ran with the
+  placeholder string) — real alarm evidence + real codebase (cited in the
+  verdict's `supporting_evidence` as `codebase:app.py`) + real structured
+  Claude call, correct verdict returned. Also confirms `max_tokens=1024`
+  with forced `tool_choice` does **not** hit the empty-response failure mode
+  seen on `claude-sonnet-5` with free-text calls at a similarly low cap
+  (adaptive thinking spending the whole budget with nothing left for
+  output) — that failure mode was previously confirmed on the free-text
+  path in `pipeline/diagnose.py`; the forced-tool-use path here returned a
+  valid verdict without needing a higher cap.
 - ✅ Deployed stack (`anomaly-review-agent`) confirmed `CREATE_COMPLETE`,
   subscribed to the real `culprit-alerts` topic.
 - ❓ **Never observed a genuine SNS-triggered invocation** — only direct
-  `aws lambda invoke` test calls that bypass SNS delivery. The SNS→Lambda
-  subscription itself is standard AWS-managed plumbing (auto-confirmed for
-  Lambda-protocol subscriptions, no custom logic involved), so this is
-  low-risk, but it has not been observed firing for real as of this writing.
+  `aws lambda invoke` / direct `_handle_alarm()` test calls that bypass SNS
+  delivery. The SNS→Lambda subscription itself is standard AWS-managed
+  plumbing (auto-confirmed for Lambda-protocol subscriptions, no custom
+  logic involved), so this is low-risk, but it has not been observed firing
+  for real as of this writing.
+- ❓ **This branch's `agent/github_context.py` changes are not yet deployed**
+  — the live `anomaly-review-agent-review` function still runs the
+  placeholder-string version until `sam deploy` is run again from this
+  branch (see `scripts/deploy.sh`; needs `GithubOwner=Tehreem404`,
+  `GithubRepo=bad_app_demo` set as parameters, since they default to empty).
 - ❌ Log evidence path (`get_log_evidence()`) has never been exercised
   against a real log group — only against fixtures. Stubbed off in the live
   deploy (§5) specifically because this was never wired up on the real

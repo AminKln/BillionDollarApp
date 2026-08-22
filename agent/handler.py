@@ -49,6 +49,7 @@ def _handle_alarm(alarm):
         owner=os.environ.get("GITHUB_OWNER", ""),
         repo=os.environ.get("GITHUB_REPO", ""),
         ref=os.environ.get("GITHUB_REF"),
+        metric_name=ctx.alarm.metric_name,
     )
 
     result = diagnose_incident(ctx, codebase_context=codebase_context)

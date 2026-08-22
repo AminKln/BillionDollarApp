@@ -31,16 +31,17 @@ Parameters:
     Type: String
     Default: ""
     Description: >
-      GitHub org/user codebase context would be fetched from. Currently
-      unused — get_codebase_context_from_github() is stubbed (agent/github_context.py).
+      GitHub org/user of the target APP's repo (not this repo) --
+      get_codebase_context_from_github() (agent/github_context.py) fetches
+      its entire current source tree live on every alarm.
   GithubRepo:
     Type: String
     Default: ""
-    Description: Repo name codebase context would be fetched from. Currently unused (stubbed).
+    Description: Repo name of the target app whose codebase context gets fetched live.
   GithubRef:
     Type: String
     Default: ""
-    Description: Branch/commit/tag to fetch codebase_context.md from. Empty = repo's default branch.
+    Description: Branch/commit/tag to fetch the codebase from. Empty = repo's default branch.
   GithubToken:
     Type: String
     NoEcho: true
