@@ -51,15 +51,22 @@ Full breakdown, including why "metric collection" is not its own workstream:
 ## Getting started
 
 ```bash
-# every laptop, first 15 minutes
-aws sts get-caller-identity      # must print the same account ID for all four
-gh auth status
-jq --version && python3 --version   # jq is required by test_dispatch.sh
-                                    # missing? sudo apt install -y jq
+make setup      # system deps: git, curl, jq, unzip, python venv, gh, aws cli v2 (sudo)
+make install    # python deps into .venv
+make check      # must print "ready." before you build anything
+```
 
-# W3 first, before any AWS work exists
+`make check` is the first-15-minutes gate from
+[architecture.md §6](docs/architecture.md#6-build-order). **All four of you
+must see the same AWS account ID.** Re-run it in the morning — credentials
+expire overnight. Both `setup` and `install` skip whatever is already there,
+so re-running them is safe.
+
+Then W3, before any AWS resource exists:
+
+```bash
 export GITHUB_TOKEN=<classic PAT, scopes repo+workflow, 1-day expiry>
-./scripts/test_dispatch.sh       # must end with: dispatch accepted (204)
+make smoke      # must end with: ALL CHECKS PASSED
 ```
 
 Pin the AWS region in team chat before anyone deploys.
@@ -67,6 +74,10 @@ Pin the AWS region in team chat before anyone deploys.
 ---
 
 ## Repo layout
+
+```
+Makefile                setup · install · check · smoke · clean
+```
 
 **On disk now** — the existing scaffolding, untouched:
 
