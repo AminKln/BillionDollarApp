@@ -36,6 +36,26 @@ SCENARIOS = {
             ("2026-08-21 14:33:00", 39),
         ],
     },
+    "ambiguous_5xx": {
+        "alarm_name": "checkout-5xx-spike",
+        "namespace": "AWS/ApplicationELB",
+        "metric_name": "HTTPCode_Target_5XX_Count",
+        "dimensions": {"LoadBalancer": "app/my-lb/abc123"},
+        "threshold": 10.0,
+        "comparison_operator": "GreaterThanThreshold",
+        "period": 60,
+        "trigger_time": datetime(2026, 8, 21, 16, 5, tzinfo=timezone.utc),
+        "baseline_avg": 1.5,
+        "anomaly_value": 62.0,
+        "unit": "Count",
+        "log_group": "/ecs/order-service",
+        "error_message": "502 Bad Gateway: upstream connect error or disconnect/reset before headers",
+        "error_bins": [
+            ("2026-08-21 16:04:00", 4),
+            ("2026-08-21 16:05:00", 58),
+            ("2026-08-21 16:06:00", 51),
+        ],
+    },
 }
 
 
