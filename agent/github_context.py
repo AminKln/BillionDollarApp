@@ -93,8 +93,16 @@ def get_codebase_context_from_github(owner: str, repo: str, ref: str | None = No
 
     scored = []
     fetch_failures = []
+    fetch_errors = []
     for entry in candidates:
-        content = _fetch_blob_text(owner, repo, entry["sha"])
+        try:
+            content = _fetch_blob_text(owner, repo, entry["sha"])
+        except RuntimeError as exc:
+            # A single file's fetch failing (rate limit, transient 5xx, etc.)
+            # shouldn't take down the whole digest -- note it and move on,
+            # same as the binary/undecodable case below.
+            fetch_errors.append((entry["path"], str(exc)))
+            continue
         if content is None:
             fetch_failures.append(entry["path"])  # binary or undecodable -- noted, not silently dropped
             continue
@@ -106,6 +114,10 @@ def get_codebase_context_from_github(owner: str, repo: str, ref: str | None = No
         lines.append("NOTE: GitHub's tree API reported this listing as truncated (repo too large for one response) -- some files may be missing entirely.")
     if fetch_failures:
         lines.append(f"NOTE: skipped {len(fetch_failures)} binary/undecodable file(s): {', '.join(fetch_failures)}")
+    if fetch_errors:
+        lines.append(f"NOTE: {len(fetch_errors)} file(s) failed to fetch (e.g. rate limit) and were skipped:")
+        for path, err in fetch_errors:
+            lines.append(f"  - {path}: {err}")
     lines.append("")
 
     budget = MAX_TOTAL_CODE_CHARS
