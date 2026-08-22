@@ -18,7 +18,7 @@ import json
 import logging
 import os
 
-from git_context import get_commit_diff
+from git_context import get_commit_diff, get_recent_prs
 from llm_review import review_diff
 from notify import publish_notification, render_widget, store_last_verdict
 
@@ -53,6 +53,7 @@ def _handle_alarm(alarm, context):
     repo = os.environ["GITHUB_REPO"]
 
     context_bundle = get_commit_diff(owner, repo, alarm_timestamp)
+    context_bundle["recent_prs"] = get_recent_prs(owner, repo, alarm_timestamp)
     verdict = review_diff(alarm, context_bundle)
 
     store_last_verdict(alarm, verdict)

@@ -36,6 +36,26 @@ Respond with ONLY a JSON object matching this shape, no other text:
 }"""
 
 
+def _format_pr_context(recent_prs):
+    if not recent_prs:
+        return ""
+    lines = ["\n\nRecent PRs merged before anomaly:"]
+    for pr in recent_prs:
+        lines.append(
+            f"\n--- PR #{pr['number']}: {pr['title']} ---\n"
+            f"Author: {pr['author']}  Merged: {pr['merged_at']}"
+        )
+        if pr.get("body"):
+            lines.append(f"Description: {pr['body']}")
+        for f in pr["files"]:
+            lines.append(
+                f"\nFile: {f['filename']} ({f['status']}, +{f['additions']}/-{f['deletions']})"
+            )
+            if f.get("patch"):
+                lines.append(f["patch"])
+    return "\n".join(lines)
+
+
 def _build_user_message(alarm, context_bundle):
     trigger = alarm.get("Trigger", {})
     anomaly_summary = {
@@ -51,6 +71,7 @@ def _build_user_message(alarm, context_bundle):
         f"{context_bundle['commits']}\n\n"
         f"Diff{' (truncated)' if context_bundle['diff_truncated'] else ''}:\n"
         f"{context_bundle['diff']}"
+        f"{_format_pr_context(context_bundle.get('recent_prs', []))}"
     )
 
 
