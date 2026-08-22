@@ -450,3 +450,66 @@ profiling for "O(n²) loops," which is exactly what the patch introduces.
 call. That is a one-field fix by a repo admin, and until it happens the demo
 still lands a diagnosed Issue, which is the design working as intended rather
 than a workaround.
+
+## Unplanned end-to-end proof — 2026-08-22 19:38–19:52Z
+
+The staged run at 19:22Z used a commit we wrote, on a schedule we chose. Between
+19:38 and 19:52Z the chain ran twice more on commits **nobody told it about**: a
+teammate was cycling `bad commit` -> `baseline` on `bad_app_demo` to exercise
+their own route. Our pipeline picked both up unprompted.
+
+| their push | our diagnosis | delay |
+|---|---|---|
+| `10c12fb6` "bad commit" 19:38:58Z | [#10] "Latency spike traced to 10c12fb6 — waiting, not working" | ~4m |
+| `9a2f16e7` "bad commit" 19:49:47Z | [#12] "Commit 9a2f16e7 likely introduced a blocking wait, spiking latency" | ~2m20s |
+
+Both diagnoses are correct and neither was primed: the commit messages say only
+"bad commit", so the mechanism — a blocking wait rather than compute — was read
+off the evidence. The tell is in the payload: `RequestLatency +336%` while
+`cpu_usage_active` fell **-90%**. Latency up with CPU *down* is a thread parked
+in `sleep`/IO, not work being done. That is the opposite signature from our own
+`73f3b39` culprit (latency +4446% *with* CPU +558%), and the agent called each
+one the right way round.
+
+This is the best evidence we have that the chain diagnoses rather than pattern-
+matches, because we did not author the input.
+
+### Wire test no longer files bogus Issues
+
+`verify_chain.sh` forces an alarm to prove the wire. That trip's "evidence" is
+whatever the app happened to be doing at the time, so a diagnosis built on it is
+noise — and before this fix it landed on GitHub as a real Issue (#6). The Lambda
+now dispatches a forced trip under `event_type: anomaly-wiretest`, which nothing
+filters on. Verified live at 19:59:34Z:
+
+```
+wire test -- dispatching as anomaly-wiretest (no workflow listens for this)
+ok 204
+wire test -- the chain is proven; not opening an Issue
+Duration: 1413.09 ms
+```
+
+GitHub still answers 204, so auth and the whole path are proven end to end; no
+workflow matches, so no run starts and no Issue appears. 1.4s instead of 36.9s.
+
+`verify_chain.sh` also now clears the alarm to OK before forcing. `set-alarm-state`
+is a no-op when the alarm is *already* in ALARM — no StateUpdate, no EventBridge
+event, no Lambda — and the log poll then blamed the wire for a transition that
+never happened. If the alarm refuses to stay OK a real breach is in flight, and
+the wire test skips rather than staging a synthetic incident on top of a live one.
+
+### Still open, and not ours to fix
+
+The `ANTHROPIC_API_KEY` **repo secret** on `Tehreem404/bad_app_demo` is still
+wrong. Confirmed again at 19:51:35Z:
+
+```
+##[error]Anthropic API 401: {"type":"authentication_error","message":"invalid x-api-key"}
+```
+
+Our copy of the same key returns 200, so the key is fine and the secret is
+mistyped — almost certainly a trailing newline or a truncated paste. We hold
+`push` but not `admin` on that repo (`{'admin': False, 'push': True}`), so only
+Tehreem can re-paste it. Until she does, every dispatch fails the Actions job and
+our Lambda takes the incident back — which is why #10 and #12 exist at all. The
+fallback is working as designed; the primary path is still unproven.
