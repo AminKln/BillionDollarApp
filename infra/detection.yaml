@@ -720,8 +720,23 @@ Resources:
               except Exception as exc:
                   print("evidence:", exc)
                   payload["evidence"] = "{}"
+              # verify_chain.sh forces this alarm into ALARM to prove the
+              # wire. That trip is synthetic: its "evidence" is whatever the
+              # app happened to be doing at the time, so a diagnosis built on
+              # it would be noise -- and it would land on GitHub as a real
+              # Issue. Dispatch it under an event_type nothing filters on.
+              # GitHub still answers 204, so the wire is proven end to end,
+              # auth included; but no workflow matches, so no run starts and
+              # no failure-net Issue appears, and the fallback agent below
+              # stays out of it entirely.
+              wire_test = "verify_chain.sh" in payload["state_reason"]
+              event_type = os.environ.get("EVENT_TYPE", "anomaly")
+              if wire_test:
+                  event_type = event_type + "-wiretest"
+                  print("wire test -- dispatching as", event_type,
+                        "(no workflow listens for this; no Issue will be opened)")
               body = json.dumps({
-                  "event_type": os.environ.get("EVENT_TYPE", "anomaly"),
+                  "event_type": event_type,
                   "client_payload": payload,
               })
               print(body)
@@ -772,7 +787,9 @@ Resources:
               wf_path = os.environ.get("RESPONSE_WORKFLOW_PATH",
                                        ".github/workflows/anomaly-response.yml")
               issue_url = None
-              if not key:
+              if wire_test:
+                  print("wire test -- the chain is proven; not opening an Issue")
+              elif not key:
                   print("no ANTHROPIC_API_KEY; fallback agent disabled")
               elif (status == 204
                     and workflow_exists(owner, repo, token, wf_path)

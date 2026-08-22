@@ -158,7 +158,13 @@ else
       SP=$(printf '%s' "$SA" | jq -r '.Period // empty')
       ST=$(printf '%s' "$SA" | jq -r '.Threshold // empty')
       SSTATE=$(printf '%s' "$SA" | jq -r '.StateValue')
-      [ "$SP" = "10" ] && ok "static alarm Period == 10" || bad "static alarm Period is '${SP:-<unset>}', expected 10"
+      # 60, not 10. The 10s period belonged to the deleted synthetic feed,
+      # which published at high resolution. The real app flushes every 10s but
+      # the alarm deliberately averages a full minute: 1-of-1 at 60s is what
+      # was calibrated against the 0.34s threshold and measured end to end
+      # (push -> ALARM in 2m10s). Do not "fix" this by lowering the period
+      # without re-measuring the whole chain.
+      [ "$SP" = "60" ] && ok "static alarm Period == 60" || bad "static alarm Period is '${SP:-<unset>}', expected 60"
       [ -n "$ST" ] && ok "static alarm Threshold is set: $ST" || bad "static alarm Threshold is not set"
       echo "     $StaticAlarmName StateValue: $SSTATE"
     fi
@@ -168,10 +174,16 @@ else
       bad "anomaly alarm '$AnomalyAlarmName' not found"
     else
       TMID=$(printf '%s' "$AA" | jq -r '.ThresholdMetricId // empty')
-      M1P=$(printf '%s' "$AA" | jq -r '[.Metrics[]? | select(.Id=="m1") | .MetricStat.Period][0] // empty')
+      # Pick the underlying metric query by the presence of MetricStat, not by
+      # a hardcoded Id. An anomaly alarm's Metrics[] holds two entries -- the
+      # metric and the ANOMALY_DETECTION_BAND expression over it -- and
+      # CloudFormation names them m2/ad2 here, not m1. Selecting on Id silently
+      # matched nothing and reported the period as unset, which looks identical
+      # to a misconfigured alarm.
+      M1P=$(printf '%s' "$AA" | jq -r '[.Metrics[]? | select(.MetricStat) | .MetricStat.Period][0] // empty')
       ASTATE=$(printf '%s' "$AA" | jq -r '.StateValue')
       [ -n "$TMID" ] && ok "anomaly alarm ThresholdMetricId is set: $TMID" || bad "anomaly alarm ThresholdMetricId is empty"
-      [ "$M1P" = "60" ] && ok "anomaly alarm m1 Period == 60" || bad "anomaly alarm m1 Period is '${M1P:-<unset>}', expected 60"
+      [ "$M1P" = "60" ] && ok "anomaly alarm metric Period == 60" || bad "anomaly alarm metric Period is '${M1P:-<unset>}', expected 60"
       echo "     $AnomalyAlarmName StateValue: $ASTATE"
     fi
 
@@ -291,6 +303,41 @@ WIRE_RESULT="skipped"
 if [ "$STACK_DEPLOYED" != 1 ]; then
   skip "wire test — stack not deployed"
 else
+  # set-alarm-state is a no-op when the alarm is ALREADY in ALARM: CloudWatch
+  # records no StateUpdate, so EventBridge emits no event, so the Lambda never
+  # runs -- and the poll below then reports "no log lines" as if the wire were
+  # broken. It is not; there was simply nothing to transition. Clear the alarm
+  # to OK first so the forced trip is a genuine OK->ALARM edge.
+  PRE_STATE=$(aws cloudwatch describe-alarms --region "$REGION" \
+    --alarm-names "$StaticAlarmName" \
+    --query 'MetricAlarms[0].StateValue' --output text 2>/dev/null)
+  WIRE_SKIP=""
+  if [ "$PRE_STATE" = "ALARM" ]; then
+    warn "$StaticAlarmName is already in ALARM — clearing it so the trip is a real transition"
+    aws cloudwatch set-alarm-state --region "$REGION" --alarm-name "$StaticAlarmName" \
+      --state-value OK --state-reason "verify_chain.sh clearing pre-existing state" >/dev/null 2>&1
+    # If a REAL breach is in flight, CloudWatch re-trips within an evaluation
+    # period and the "forced" trip would actually be someone's live incident --
+    # which the Lambda would rightly diagnose and file as a GitHub Issue. Do
+    # not stage a synthetic test on top of a real one; say so and move on.
+    settle=0
+    while [ $settle -lt 6 ]; do
+      sleep 5
+      settle=$((settle + 1))
+      PRE_STATE=$(aws cloudwatch describe-alarms --region "$REGION" \
+        --alarm-names "$StaticAlarmName" \
+        --query 'MetricAlarms[0].StateValue' --output text 2>/dev/null)
+      [ "$PRE_STATE" = "OK" ] && break
+    done
+    if [ "$PRE_STATE" != "OK" ]; then
+      WIRE_SKIP="a real alarm is in progress on $StaticAlarmName (state stayed $PRE_STATE)"
+    fi
+  fi
+fi
+
+if [ "$STACK_DEPLOYED" = 1 ] && [ -n "$WIRE_SKIP" ]; then
+  skip "wire test — $WIRE_SKIP; not forcing a synthetic trip on top of a live incident"
+elif [ "$STACK_DEPLOYED" = 1 ]; then
   TRIP_EPOCH_MS=$(( $(date -u +%s) * 1000 - 5000 ))  # 5s buffer for clock skew
   SET_OUT=$(aws cloudwatch set-alarm-state --region "$REGION" --alarm-name "$StaticAlarmName" \
     --state-value ALARM --state-reason "verify_chain.sh forced trip" 2>&1)
@@ -345,6 +392,13 @@ else
       fi
     else
       bad "no log lines appeared in $DispatchLogGroupName within 60s"
+      echo "     alarm state right now:"
+      aws cloudwatch describe-alarm-history --region "$REGION" \
+        --alarm-name "$StaticAlarmName" --history-item-type StateUpdate \
+        --max-records 3 --query 'AlarmHistoryItems[].[Timestamp,HistorySummary]' \
+        --output text 2>/dev/null | sed 's/^/       /'
+      echo "     if the newest entry predates the trip, the alarm was already in"
+      echo "     ALARM and set-alarm-state was a no-op — the wire is fine."
       echo "     debugging pointers:"
       echo "       aws events describe-rule --region $REGION --name $RuleName"
       echo "       aws events list-targets-by-rule --region $REGION --rule $RuleName"
