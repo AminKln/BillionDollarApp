@@ -31,6 +31,15 @@ SENSITIVITY=${LATENCY_SENSITIVITY:-8}
 EVENT_TYPE=${DISPATCH_EVENT_TYPE:-anomaly}
 ALERT_EMAIL=${ALERT_EMAIL:-}
 GITHUB_TOKEN=${GITHUB_TOKEN:-}
+ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+
+# Secrets may be handed over in a file under $HOME instead of the environment,
+# which keeps them out of shell history as well as out of git. Env wins if set.
+# These paths are deliberately outside the repo -- nothing here is ever staged.
+[ -z "$GITHUB_TOKEN" ] && [ -r "$HOME/.culprit-gh-token" ] && \
+  GITHUB_TOKEN=$(tr -d '\r\n' < "$HOME/.culprit-gh-token")
+[ -z "$ANTHROPIC_API_KEY" ] && [ -r "$HOME/.culprit-anthropic-key" ] && \
+  ANTHROPIC_API_KEY=$(tr -d '\r\n' < "$HOME/.culprit-anthropic-key")
 
 RED=$'\e[31m'; GRN=$'\e[32m'; YEL=$'\e[33m'; DIM=$'\e[2m'; RST=$'\e[0m'
 ok()  { echo "  ${GRN}ok${RST}   $*"; }
@@ -58,8 +67,11 @@ if [ -n "${APP_LATENCY_THRESHOLD_SECONDS:-}" ]; then
   THRESHOLD=$APP_LATENCY_THRESHOLD_SECONDS
   SRC="APP_LATENCY_THRESHOLD_SECONDS env var"
 else
-  THRESHOLD=0.5
-  SRC="default — run ./scripts/calibrate.sh to confirm against live data"
+  # 0.34, not 0.5: this is what ./scripts/calibrate.sh derived from live
+  # traffic and what the deployed culprit-App-High actually carries. Leaving
+  # the old 0.5 here meant any redeploy silently walked the live alarm back.
+  THRESHOLD=0.34
+  SRC="calibrated against live data; matches the deployed alarm"
 fi
 
 echo "deploying ${STACK} to ${REGION}"
@@ -69,6 +81,8 @@ echo "  sensitivity $SENSITIVITY"
 echo "  dispatch    ${OWNER}/${REPO}  event_type=${EVENT_TYPE}"
 if [ -n "$GITHUB_TOKEN" ]; then echo "  token       ${GRN}set${RST} (${#GITHUB_TOKEN} chars)";
 else echo "  token       ${YEL}absent${RST} — Lambda will log the payload instead of POSTing"; fi
+if [ -n "$ANTHROPIC_API_KEY" ]; then echo "  claude key  ${GRN}set${RST} (${#ANTHROPIC_API_KEY} chars) — Lambda opens the Issue if no workflow is listening";
+else echo "  claude key  ${YEL}absent${RST} — no fallback agent; the response depends entirely on GitHub Actions"; fi
 [ -n "$ALERT_EMAIL" ] && echo "  email       $ALERT_EMAIL  (confirm the SNS subscription in your inbox)"
 echo
 
@@ -86,6 +100,7 @@ PARAMS=(
   "GithubToken=$GITHUB_TOKEN"
   "DispatchEventType=$EVENT_TYPE"
   "AlertEmail=$ALERT_EMAIL"
+  "AnthropicApiKey=$ANTHROPIC_API_KEY"
 )
 
 aws cloudformation deploy \

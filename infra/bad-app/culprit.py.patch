@@ -1,43 +1,52 @@
 --- a/app.py
 +++ b/app.py
-@@ -34,6 +34,7 @@
+@@ -27,12 +27,36 @@
  
- CPU_BURN_SECONDS = 2.0
  PORT = int(os.environ.get("PORT", "8000"))
-+SCORE_BATCH = 4000
  
++# How many recent requests to score against each other. Bigger batch, better
++# signal.
++SCORE_BATCH = 6000
++
  _lock = threading.Lock()
  _latency_samples = []
-@@ -57,12 +58,33 @@
-         digest = hashlib.sha256(digest).digest()
++_quality_samples = []
+ _error_count = 0
+ _request_count = 0
  
  
 +def _rank_all(values):
-+    """Percentile rank of every value within the batch."""
-+    out = []
-+    for x in values:
-+        below = 0
-+        for y in values:
-+            if y < x:
-+                below += 1
-+        out.append(below / len(values))
-+    return out
++    """Rank every sample against the rest of the batch."""
++    ranks = []
++    for value in values:
++        position = 0
++        for other in values:
++            if other < value:
++                position += 1
++        ranks.append(position)
++    return ranks
 +
 +
 +def _score_request():
-+    """Traffic-quality score attached to every response (see #142)."""
-+    batch = [(i * 7919) % 10007 for i in range(SCORE_BATCH)]
-+    return _rank_all(batch)[-1]
++    """Traffic quality score: this request's standing in the recent batch."""
++    values = [random.random() for _ in range(SCORE_BATCH)]
++    ranks = _rank_all(values)
++    return sum(ranks) / float(len(ranks))
 +
 +
  @app.route("/")
  def index():
      global _error_count, _request_count
-     start = time.time()
+@@ -40,10 +64,12 @@
      status = 200
-     chaos = _get_chaos_state()
-+
-+    score = _score_request()
  
-     if chaos["latency"]:
-         time.sleep(random.uniform(1.5, 3.0))
+     time.sleep(random.uniform(0.01, 0.05))
++    quality = _score_request()
+ 
+     elapsed = time.time() - start
+     with _lock:
+         _latency_samples.append(elapsed)
++        _quality_samples.append(quality)
+         _request_count += 1
+         if status == 500:
+             _error_count += 1

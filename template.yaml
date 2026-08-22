@@ -24,8 +24,9 @@ Parameters:
     Default: anthropic.claude-3-5-sonnet-20241022-v2:0
     Description: >
       PLACEHOLDER — confirm against the model your Bedrock access request
-      actually grants (docs/architecture.md section 9, bottleneck #1) before
-      first real deploy.
+      actually grants. AWS retired this default on 2025-10-28, so the first
+      real invoke throws (docs/architecture.md section 10, template.yaml:24)
+      before first real deploy.
   NotifyEmail:
     Type: String
     Description: Email address subscribed to the human-facing verdict notifications.

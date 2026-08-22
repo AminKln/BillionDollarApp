@@ -78,9 +78,8 @@ Parameters:
     Default: 0.5
     Description: >
       Static latency threshold for the EC2 app, in SECONDS -- bad_app.py
-      publishes RequestLatency with Unit=Seconds, unlike the synthetic feed
-      which publishes milliseconds. Healthy is ~0.05 and the chaos toggle
-      sleeps 1.5-3.0s, so 0.5 sits clear of both.
+      publishes RequestLatency with Unit=Seconds. Healthy is ~0.05 and the
+      chaos toggle sleeps 1.5-3.0s, so 0.5 sits clear of both.
   LatencySensitivity:
     Type: Number
     Default: 8
@@ -112,6 +111,30 @@ Parameters:
       Classic PAT with repo scope. Empty is allowed so the stack deploys
       before W3 mints the token; the dispatch Lambda logs and no-ops instead
       of calling GitHub when this is unset.
+
+  AnthropicApiKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: >
+      Anthropic API key. Optional. When set, and only when the repo has no
+      anomaly-response workflow to receive the repository_dispatch, the
+      dispatch Lambda itself becomes the agent: it reads the evidence and the
+      recent commits, asks Claude for a diagnosis, and opens a GitHub Issue.
+      This is the demo's floor -- it needs no repo-admin secret and no Actions.
+      Pass via --parameter-overrides; never commit a real value.
+  AgentModelId:
+    Type: String
+    Default: claude-sonnet-5
+    Description: Model the dispatch Lambda's fallback agent calls.
+  ResponseWorkflowPath:
+    Type: String
+    Default: .github/workflows/anomaly-response.yml
+    Description: >
+      Path the Lambda probes to decide whether GitHub Actions will handle this
+      alarm. Present -> dispatch only, Actions owns the PR. Absent -> the
+      Lambda opens the Issue itself. Self-correcting: it goes quiet the moment
+      the workflow lands.
 
   DispatchEventType:
     Type: String
@@ -254,7 +277,7 @@ Resources:
       DatapointsToAlarm: 1
       Threshold: 5
       ComparisonOperator: GreaterThanThreshold
-      # Corroboration and a second demo lever (trigger_chaos.sh errors on).
+      # Corroboration and a second demo lever (chaos.sh errors on).
       # Deliberately NOT in the EventBridge rule: a latency regression is the
       # story this pipeline tells, and errors would dispatch a second time.
       TreatMissingData: ignore
@@ -322,7 +345,10 @@ Resources:
       FunctionName: culprit-dispatch
       Runtime: python3.12
       Handler: index.handler
-      Timeout: 30
+      # 180s, not 30: the fallback may wait out an entire Actions run
+      # (up to ~80s) before deciding to take the incident back, then still
+      # needs three GitHub calls plus an Anthropic completion of its own.
+      Timeout: 180
       MemorySize: 256
       Role: !GetAtt DispatchFunctionRole.Arn
       Environment:
@@ -331,6 +357,9 @@ Resources:
           GITHUB_REPO: !Ref GithubRepo
           GITHUB_TOKEN: !Ref GithubToken
           EVENT_TYPE: !Ref DispatchEventType
+          ANTHROPIC_API_KEY: !Ref AnthropicApiKey
+          AGENT_MODEL_ID: !Ref AgentModelId
+          RESPONSE_WORKFLOW_PATH: !Ref ResponseWorkflowPath
           DASHBOARD_URL: !Sub "https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=Culprit"
       Code:
         # culprit-dispatch. Stdlib + boto3 (both in the runtime); no packaging step.
@@ -405,7 +434,7 @@ Resources:
         # spent (boto3/datetime are hoisted to the shared import line); the
         # next step is packaging the function to S3 instead of inlining it.
         ZipFile: |
-          import boto3, datetime, json, os, urllib.error, urllib.request
+          import boto3, datetime, json, os, time, urllib.error, urllib.request
 
 
           def dup(primary, region):
@@ -436,6 +465,217 @@ Resources:
                   out[d["Label"]] = {"before": round(b, 3), "now": round(n, 3),
                                      "change": "flat" if abs(c) < 25 else "%+.0f%%" % c}
               return out
+
+
+          GH = "https://api.github.com"
+
+
+          def gh(method, path, token, body=None):
+              """One GitHub REST call. Returns (status, parsed-json-or-raw)."""
+              data = json.dumps(body).encode("utf-8") if body is not None else None
+              req = urllib.request.Request(
+                  GH + path, data=data, method=method,
+                  headers={
+                      "Authorization": "Bearer " + token,
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "User-Agent": "culprit-dispatch",
+                      "Content-Type": "application/json",
+                  })
+              try:
+                  with urllib.request.urlopen(req, timeout=15) as r:
+                      raw = r.read()
+                      try:
+                          return r.getcode(), json.loads(raw or b"null")
+                      except Exception:
+                          return r.getcode(), raw
+              except urllib.error.HTTPError as exc:
+                  return exc.code, exc.read()[:300]
+              except Exception as exc:
+                  print("gh err", method, path, exc)
+                  return None, None
+
+
+          def workflow_exists(owner, repo, token, path):
+              """Is there an Actions workflow to receive the dispatch?
+
+              This is the whole switch between the two output paths. 200 means
+              GitHub Actions owns the response and will open the PR with its own
+              built-in secrets.GITHUB_TOKEN, so the Lambda stays quiet. 404 means
+              nothing is listening and a repository_dispatch would vanish
+              silently -- GitHub returns 204 for a dispatch whether or not any
+              workflow filters on it, so the POST's status can never tell us
+              this. On any other status (403, rate limit, network) we assume the
+              workflow IS there and do nothing, because opening a duplicate
+              Issue next to a real PR is worse than opening none.
+              """
+              status, _ = gh("GET", "/repos/%s/%s/contents/%s" % (owner, repo, path), token)
+              print("workflow probe:", path, "->", status)
+              return status != 404
+
+
+          def dispatch_handled(owner, repo, token, since):
+              """Did Actions actually start a run for the dispatch we just sent?
+
+              Existence of the workflow FILE is not the same as the response
+              happening. Actions can be disabled on the repo, the workflow can
+              be off, or the file can be on a branch Actions never reads. This
+              polls the runs list for ~30s for a repository_dispatch run newer
+              than our POST. If one appears, Actions owns the incident and this
+              Lambda must stay quiet -- even if that run later fails, because
+              the workflow files its own Issue from an if: failure() step.
+              """
+              path = "/repos/%s/%s/actions/runs?event=repository_dispatch&per_page=10" % (owner, repo)
+              run = None
+              for _ in range(6):
+                  time.sleep(5)
+                  status, body = gh("GET", path, token)
+                  if status != 200 or not isinstance(body, dict):
+                      print("runs probe:", status)
+                      continue
+                  for r in body.get("workflow_runs", []):
+                      if (r.get("created_at") or "") >= since:
+                          run = r
+                          break
+                  if run:
+                      break
+              if not run:
+                  print("no Actions run appeared within 30s")
+                  return False
+              print("actions picked it up:", run.get("html_url"))
+
+              # Started is not the same as answered. A run that dies -- a bad
+              # ANTHROPIC_API_KEY secret is the likely one -- leaves the
+              # incident with only its own raw-evidence Issue and no diagnosis,
+              # so take the incident back and file the real one.
+              one = "/repos/%s/%s/actions/runs/%s" % (owner, repo, run.get("id"))
+              for _ in range(10):
+                  status, body = gh("GET", one, token)
+                  if status == 200 and isinstance(body, dict) and body.get("status") == "completed":
+                      print("actions run completed:", body.get("conclusion"))
+                      return body.get("conclusion") == "success"
+                  time.sleep(5)
+              print("actions run still going; leaving the incident to it")
+              return True
+
+
+          def recent_commits(owner, repo, token, n=6):
+              status, body = gh("GET", "/repos/%s/%s/commits?per_page=%d" % (owner, repo, n), token)
+              if status != 200 or not isinstance(body, list):
+                  print("commits probe:", status)
+                  return []
+              out = []
+              for c in body:
+                  commit = c.get("commit", {})
+                  out.append({
+                      "sha": (c.get("sha") or "")[:8],
+                      "message": (commit.get("message") or "").split("\n")[0][:120],
+                      "author": (commit.get("author") or {}).get("name", ""),
+                      "date": (commit.get("author") or {}).get("date", ""),
+                  })
+              return out
+
+
+          def ask_claude(payload, commits, key, model):
+              """One Messages API call. Returns (title, markdown_body) or None."""
+              prompt = (
+                  "You are an SRE on-call agent. A CloudWatch alarm just fired on a "
+                  "production web app. Using ONLY the evidence below, identify which "
+                  "recent commit most likely caused the regression and explain the "
+                  "mechanism.\n\n"
+                  "ALARM\n"
+                  "  name: %s\n  metric: %s in namespace %s\n  threshold: %s\n"
+                  "  datapoints that broke it: %s\n  reason: %s\n  fired at: %s\n\n"
+                  "METRIC EVIDENCE (before = the 20 min preceding the alarm, "
+                  "now = the moment it fired; 'flat' means the change was under 25%%)\n%s\n\n"
+                  "RECENT COMMITS (newest first)\n%s\n\n"
+                  "The discriminating question is WHICH metrics moved together. Latency "
+                  "rising with CPU means the code is doing more work per request. Latency "
+                  "rising while CPU falls or stays flat means the code is waiting, not "
+                  "working. Memory or disk moving instead points somewhere else entirely. "
+                  "Say which pattern this is and what it rules out.\n\n"
+                  "Reply with ONLY a JSON object, no prose around it, no code fence:\n"
+                  '{"title": "<one line, under 80 chars, names the suspected commit>", '
+                  '"culprit_sha": "<short sha or empty>", '
+                  '"body": "<GitHub-flavored markdown: what broke, the evidence table, '
+                  'the suspected commit and why, the mechanism, and a concrete suggested fix>"}'
+              ) % (
+                  payload.get("alarm_name", ""), payload.get("metric_name", ""),
+                  payload.get("namespace", ""), payload.get("threshold", ""),
+                  payload.get("datapoints", ""), payload.get("state_reason", ""),
+                  payload.get("timestamp", ""),
+                  json.dumps(json.loads(payload.get("evidence") or "{}"), indent=2),
+                  json.dumps(commits, indent=2) or "(none readable)",
+              )
+              req = urllib.request.Request(
+                  "https://api.anthropic.com/v1/messages",
+                  data=json.dumps({
+                      "model": model,
+                      "max_tokens": 2000,
+                      "messages": [{"role": "user", "content": prompt}],
+                  }).encode("utf-8"),
+                  method="POST",
+                  headers={
+                      "x-api-key": key,
+                      "anthropic-version": "2023-06-01",
+                      "content-type": "application/json",
+                  })
+              try:
+                  with urllib.request.urlopen(req, timeout=60) as r:
+                      body = json.loads(r.read())
+              except urllib.error.HTTPError as exc:
+                  print("anthropic fail", exc.code, exc.read()[:300])
+                  return None
+              except Exception as exc:
+                  print("anthropic err", exc)
+                  return None
+              text = "".join(b.get("text", "") for b in body.get("content", [])
+                             if b.get("type") == "text").strip()
+              if text.startswith("```"):
+                  text = text.split("\n", 1)[-1].rsplit("```", 1)[0]
+              try:
+                  obj = json.loads(text)
+                  return obj.get("title", "").strip(), obj.get("body", "").strip()
+              except Exception as exc:
+                  print("anthropic parse:", exc)
+                  # Still useful -- ship the raw diagnosis rather than nothing.
+                  return None, text
+
+
+          def agent_issue(payload, owner, repo, token, key, model):
+              """No workflow listening -> the Lambda is the agent. Opens the Issue."""
+              commits = recent_commits(owner, repo, token)
+              got = ask_claude(payload, commits, key, model)
+              if got is None:
+                  return None
+              title, md = got
+              if not md:
+                  return None
+              if not title:
+                  title = "Latency regression: %s fired" % payload.get("alarm_name", "alarm")
+              footer = (
+                  "\n\n---\n"
+                  "<sub>Opened automatically by `culprit-dispatch` from CloudWatch alarm "
+                  "**%s** at %s. "
+                  "[CloudWatch dashboard](%s)</sub>"
+              ) % (payload.get("alarm_name", ""), payload.get("timestamp", ""),
+                   payload.get("dashboard_url", ""))
+              status, body = gh("POST", "/repos/%s/%s/issues" % (owner, repo), token,
+                                {"title": title[:120], "body": md + footer,
+                                 "labels": ["anomaly", "automated"]})
+              if status in (200, 201) and isinstance(body, dict):
+                  print("issue opened:", body.get("html_url"))
+                  return body.get("html_url")
+              # Labels must already exist on the repo or GitHub 422s the whole
+              # create. Retry once without them rather than lose the Issue.
+              if status == 422:
+                  status, body = gh("POST", "/repos/%s/%s/issues" % (owner, repo), token,
+                                    {"title": title[:120], "body": md + footer})
+                  if status in (200, 201) and isinstance(body, dict):
+                      print("issue opened (no labels):", body.get("html_url"))
+                      return body.get("html_url")
+              print("issue fail", status, body)
+              return None
 
 
           def handler(event, context):
@@ -503,17 +743,51 @@ Resources:
                       "User-Agent": "culprit-dispatch",
                       "Content-Type": "application/json",
                   })
+              # Stamped before the POST so the runs probe below can tell our
+              # run apart from an older one still sitting in the list.
+              since = (datetime.datetime.utcnow()
+                       - datetime.timedelta(seconds=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+              status = None
               try:
                   with urllib.request.urlopen(req, timeout=10) as resp:
                       status = resp.getcode()
                       print("ok", status)
-                      return {"ok": status == 204, "status": status}
               except urllib.error.HTTPError as exc:
                   print("fail", exc.code, exc.read()[:300])
-                  return {"ok": False, "status": exc.code}
+                  status = exc.code
               except Exception as exc:
                   print("err", exc)
-                  return {"ok": False, "status": None}
+
+              # ── Fallback: no workflow listening, so BE the agent ──────────
+              #
+              # repository_dispatch answers 204 whether or not a workflow
+              # filters on the event, so a happy status above proves nothing
+              # about the response actually happening. Probe for the workflow;
+              # if it is genuinely absent, read the evidence and the recent
+              # commits, ask Claude what broke, and open the Issue directly.
+              # Costs one extra GET on the happy path and is silent there.
+              owner = os.environ.get("GITHUB_OWNER", "")
+              repo = os.environ.get("GITHUB_REPO", "")
+              key = os.environ.get("ANTHROPIC_API_KEY", "")
+              wf_path = os.environ.get("RESPONSE_WORKFLOW_PATH",
+                                       ".github/workflows/anomaly-response.yml")
+              issue_url = None
+              if not key:
+                  print("no ANTHROPIC_API_KEY; fallback agent disabled")
+              elif (status == 204
+                    and workflow_exists(owner, repo, token, wf_path)
+                    and dispatch_handled(owner, repo, token, since)):
+                  print("Actions owns the response; staying quiet")
+              else:
+                  print("nothing is handling this dispatch -- opening the Issue here")
+                  try:
+                      issue_url = agent_issue(
+                          payload, owner, repo, token, key,
+                          os.environ.get("AGENT_MODEL_ID", "claude-sonnet-5"))
+                  except Exception as exc:
+                      print("fallback agent err", exc)
+
+              return {"ok": status == 204, "status": status, "issue": issue_url}
   # ── EventBridge wiring ──────────────────────────────────────────────────
 
   AlarmStateChangeRule:
@@ -558,7 +832,7 @@ Resources:
     Properties:
       DashboardName: Culprit
       # Widget order is the demo script: the real app on top, the alarm
-      # panel beside it, the synthetic feed underneath. A viewer who has
+      # panel beside it, host CPU/mem/disk underneath. A viewer who has
       # never seen this stack should be able to watch the top-left graph
       # cross its band and the panel beside it go red, in that order.
       #
@@ -573,7 +847,7 @@ Resources:
             {
               "type": "text", "x": 0, "y": 0, "width": 24, "height": 2,
               "properties": {
-                "markdown": "# Culprit \u2014 latency regression detection\n**Top row is the live EC2 demo app.** Bottom rows are the synthetic feed that keeps the pipeline exercised. To force a regression: `DEMO_APP_HOST=http://<ec2-ip>:8000 ./scripts/trigger_chaos.sh latency on` \u2014 static alarm fires in ~60s, the band follows, and one GitHub dispatch goes out."
+                "markdown": "# Culprit \u2014 latency regression detection\n**All widgets below are the live EC2 demo app.** To force a regression: `./scripts/chaos.sh cpu on` \u2014 static alarm fires in ~60s, the band follows, and one GitHub dispatch goes out. Run `./scripts/chaos.sh off` to reset."
               }
             },
             {
@@ -601,10 +875,7 @@ Resources:
                 "alarms": [
                   "arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:culprit-App-High",
                   "arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:culprit-App-Anomaly",
-                  "arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:culprit-App-ErrorRate",
-                  "arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:culprit-Latency-High",
-                  "arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:culprit-Latency-Anomaly",
-                  "arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:culprit-Load-High"
+                  "arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:culprit-App-ErrorRate"
                 ]
               }
             },

@@ -336,21 +336,22 @@ tripped"* — and it works before there is any real regression to wait for.
 To demo against the **real app** (this is the one to show):
 
 ```bash
-make app-status     # is the box reachable, and is chaos already on?
-make app-regress    # flip the real app into the slow state
-make alarms         # culprit-App-High -> ALARM (~60-90s)
-make logs           # watch the dispatch Lambda POST it
-make app-recover    # turn chaos back off — do not skip this
+make regress-commit  # push the culprit commit; the box redeploys itself
+make alarms          # culprit-App-High -> ALARM (~2-3 min)
+make payload         # the evidence the agent was handed
+make revert-commit   # push the revert — do not skip this
 ```
 
-`make app-regress` finds the instance by its `Name=hackathon-demo` tag rather
-than a pinned IP, because the public IP changes across a stop/start and a
-demo that dies on a stale address is not worth the two lines it saves.
+The trigger is a **git commit**, not a runtime knob. `scripts/regress_commit.sh`
+applies `infra/bad-app/culprit.py.patch` in a scratch clone and pushes to
+`main`; the repo's own `Deploy to EC2` workflow SSHes into the box and restarts
+the app. That matters because the thing the agent has to find is then a thing
+that was really pushed, with a real diff and a real author and a real timestamp.
 
-The app's chaos toggle takes latency from ~0.05s to a `random.uniform(1.5, 3.0)`
-sleep — a 45x jump. That is why `culprit-App-High` is 1-of-1 rather than 2-of-2:
-a jump that size is never noise, so a second confirming period would buy no
-accuracy and cost a minute of demo silence.
+The culprit takes latency from ~0.03s to ~1.19s — a 40x jump against a 0.34s
+threshold. That is why `culprit-App-High` is 1-of-1 rather than 2-of-2: a jump
+that size is never noise, so a second confirming period would buy no accuracy
+and cost a minute of demo silence.
 
 There is no second way to demo this any more, and that is deliberate. The
 synthetic feed was the fallback; it was also a second source of truth wired into
@@ -363,25 +364,19 @@ GitHub — is the fallback now, and it is an honest one.
 
 | Faked now | Replaced by | Swap cost |
 |---|---|---|
-| ~~`seed_metrics.py` is the only source~~ | **done.** W1's app on EC2 is live and alarmed (`culprit-App-*`). The synthetic feed is kept deliberately — 10s resolution, a trained band, and the two discriminator metrics. | already paid: 4 CloudFormation resources, no Lambda change |
+| ~~`seed_metrics.py` is the only source~~ | **done, then deleted.** W1's app on EC2 is live and alarmed (`culprit-App-*`). The synthetic feed did its job as a rehearsal rig and was deleted on 2026-08-22 once the real app was carrying the demo — `decisions.md` §9. | already paid: 4 CloudFormation resources, no Lambda change |
 | The app emits no `WorkUnits` / `RequestCount`, so app-triggered dispatches carry weaker evidence | W1 adds a work counter and a request counter to `bad_app.py` | ~2 lines in W1; nothing in W2 — `evidence()` finds new metrics in the namespace by `SEARCH`, no redeploy |
 | `culprit-App-Anomaly` is `INSUFFICIENT_DATA` — the band needs ~3h and the box booted at 13:53Z | time (usable ~17:00Z) | none. Not backfillable: writing synthetic points into a teammate's real metric stream would corrupt the very baseline it is meant to learn. |
-| `make regress` flips a flag file; `make app-regress` flips the app's chaos toggle | W1 pushes the bad commit; the box redeploys; latency really rises | none — the alarm cannot tell the difference, and `make app-regress` already exercises the real app over the real network |
-| `GITHUB_TOKEN` may be empty at deploy | W3 mints the classic PAT (`repo` + `workflow`, 1-day expiry) and it goes in via `--parameter-overrides` | redeploy. Until then the Lambda logs the exact payload it *would* have sent, so the payload is still reviewable. |
-| `.github/workflows/dispatch-receipt.yml` just echoes the payload | W3's `anomaly-response.yml` runs Claude and opens the PR | none — both listen for `event_type: anomaly` and can run side by side |
-| Synthetic threshold is calibrated; the app's `0.5s` was reasoned, not measured | recalibrate against the app's observed baseline | `make deploy` with a new `AppLatencyThresholdSeconds`. Healthy is ~0.05 and chaos is 1.5–3.0s, so 0.5 sits an order of magnitude clear of both — this is low-risk. |
+| ~~`make regress` flips a flag file; `make app-regress` flips the app's chaos toggle~~ | **done.** `make regress-commit` pushes a real commit; the repo's `Deploy to EC2` workflow restarts the box; latency really rises. The chaos toggles were removed from the app upstream, so this is now the only trigger. | already paid |
+| ~~`GITHUB_TOKEN` may be empty at deploy~~ | **done.** Classic PAT (`repo` + `workflow`) minted and passed via `--parameter-overrides`; the stack is deployed with it. A fine-grained PAT cannot work here — it can only target repos owned by the token holder, and `bad_app_demo` is a teammate's personal repo. | already paid |
+| ~~`.github/workflows/dispatch-receipt.yml` just echoes the payload~~ | **done.** `anomaly-response.yml` is pushed to `bad_app_demo` and calls the Anthropic Messages API to open a PR, with an `if: failure()` net that files raw evidence as an Issue. | already paid |
+| ~~The app's `0.5s` threshold was reasoned, not measured~~ | **done.** Recalibrated to **0.34s** against the app's observed baseline (~0.03s healthy, ~1.19s regressed). `deploy_detection.sh`'s own default was moved to 0.34 too, so a redeploy can no longer silently walk the live alarm back. | already paid |
 
-One row is not in that table because it is not a gap in the design, it is a
-gap in the *testing*: `make app-regress` → `culprit-App-High` → dispatch has
-never been run as a single unbroken sequence. Every link in it is individually
-proven — the alarm evaluates the real metric (`0.0496 not greater than 0.5`),
-forcing it to ALARM does produce exactly one dispatch carrying
-`namespace: HackathonDemo`, and the chaos endpoint does respond — but the
-arithmetic step in the middle (chaos actually pushing the 60s average past
-0.5s) has only been reasoned about, not observed. It should be: healthy is
-~0.05 and the chaos sleep is 1.5–3.0s. Run it once before the demo; it takes
-about three minutes and it is a shared box, so `make app-recover` is not
-optional.
+That table used to carry one more row that was not a design gap but a *testing*
+gap: the full `regress → alarm → dispatch → GitHub` sequence had never been run
+unbroken. It has now — see `## End-to-end run` below. Re-run it before the demo
+anyway; it takes about three minutes and it is a shared box, so
+`make revert-commit` is not optional.
 
 Nothing else in that table blocks anything else in it. Each row can be swapped
 independently, in any order.
@@ -394,17 +389,16 @@ independently, in any order.
   in the console. Mitigated by a one-day expiry, not by encryption. The correct
   answer is an SSM SecureString and it is a ten-minute change we chose not to
   spend. Say this before a judge asks.
-- **The anomaly band is the weakest link on demo day.** If the publisher dies
-  overnight the band regresses to untrained and the ML alarm shows
-  `INSUFFICIENT_DATA`. `make metrics-status` is the check. The static alarm is
-  unaffected, which is exactly why the demo triggers on it. The app's band has
-  the same exposure for a different reason: it has simply not existed long
-  enough yet.
+- **The anomaly band is the weakest link on demo day.** `culprit-App-Anomaly`'s
+  band needs hours of real traffic to train; until it has them the ML alarm
+  shows `INSUFFICIENT_DATA`. `make alarms` is the check. The static alarm is
+  unaffected, which is exactly why the demo triggers on it.
 - **`culprit-App-High` is 1-of-1.** A single 60-second period over the app's
-  threshold dispatches. That is correct for a 45x chaos jump and wrong for a
+  threshold dispatches. That is correct for a 40x regression and wrong for a
   subtler regression, where one unlucky period could dispatch on noise. The
-  trade was made for demo latency, knowingly. `culprit-Latency-High` on the
-  synthetic feed is 2-of-2 and is the more defensible setting.
+  trade was made for demo latency, knowingly. (The deleted synthetic feed's
+  `culprit-Latency-High` used a 2-of-2 setting — more defensible, less
+  demo-friendly.)
 - **The EC2 app is not in this repo.** It was deployed by hand, so nothing here
   reproduces it and `infra/detection.yaml` hardcodes no instance id (host
   metrics come in via `SEARCH`) precisely so a replaced box does not break the
@@ -416,3 +410,43 @@ independently, in any order.
   (`scripts/test_dispatch.sh` is a scope smoke-test, not a replayer — it sends
   a probe payload of its own.)
 - **One region, one account.** No multi-region failover, by choice.
+
+---
+
+## End-to-end run — 2026-08-22
+
+The full chain was run unbroken against the real app, with nothing stubbed and
+no human step between the push and the GitHub artifact.
+
+| | clock | from push |
+|---|---|---|
+| `./scripts/regress_commit.sh apply` pushes `73f3b39` to `bad_app_demo` | 19:22:46Z | — |
+| the repo's `Deploy to EC2` workflow SSHes in and restarts the app | 19:23:28Z | +42s |
+| `RequestLatency` 0.030 -> 0.620 in CloudWatch | 19:24:12Z | +1m26s |
+| **`culprit-App-High` OK -> ALARM** | **19:24:56Z** | **+2m10s** |
+| SNS -> `culprit-dispatch`; `repository_dispatch` POST returns 204 | 19:24:5xZ | — |
+| Lambda finds the Actions run, polls it, sees `conclusion: failure` | 19:25:03Z | +2m17s |
+| **Lambda takes the incident back and files the diagnosed Issue** | **19:25:25Z** | **+2m39s** |
+| `./scripts/regress_commit.sh revert` | 19:25:52Z | +3m06s |
+
+The evidence the Lambda assembled:
+
+```
+RequestLatency       0.03  -> 1.383   +4446%
+cpu_usage_active     1.607 -> 10.578   +558%
+ErrorRate            0.0   -> 0.0       flat
+mem_used_percent    40.945 -> 39.758    flat
+disk_used_percent   30.579 -> 30.587    flat
+```
+
+[Issue #4](https://github.com/Tehreem404/bad_app_demo/issues/4) named the
+culprit by SHA — *"`73f3b398` — Add per-request traffic quality score (#142)"* —
+ruled out each of the five other recent commits individually, identified the
+mechanism as synchronous per-request compute on the hot path, and recommended
+profiling for "O(n²) loops," which is exactly what the patch introduces.
+
+**This run took the Lambda-takeover branch, not the PR branch.** The repo's
+`ANTHROPIC_API_KEY` Actions secret is mistyped — the workflow 401s at the Claude
+call. That is a one-field fix by a repo admin, and until it happens the demo
+still lands a diagnosed Issue, which is the design working as intended rather
+than a workaround.

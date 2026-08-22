@@ -17,7 +17,7 @@ PIP     := $(VENV)/bin/pip
 REQS    := $(wildcard requirements.txt app/requirements.txt)
 
 .DEFAULT_GOAL := help
-.PHONY: help setup install check smoke clean setup-gh setup-awscli calibrate deploy verify logs alarms dashboard destroy
+.PHONY: help setup install check smoke clean setup-gh setup-awscli calibrate deploy verify logs alarms dashboard destroy regress-commit revert-commit
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -40,6 +40,10 @@ help:
 	@echo "    make app-status     is it reachable, is chaos on?"
 	@echo "    make app-regress    latency 0.05s -> 1.5-3.0s  -> alarm  -> dispatch"
 	@echo "    make app-recover    turn it back off — SHARED BOX, do not skip"
+	@echo
+	@echo "  source-level regression, in bad_app_demo itself (a real commit, real PR):"
+	@echo "    make regress-commit  plant the culprit commit on bad_app_demo main, push"
+	@echo "    make revert-commit   git revert it and push — the fix the PR should look like"
 	@echo
 	@echo "  supporting targets:"
 	@echo "    make calibrate      re-derive the alarm threshold from observed data"
@@ -244,6 +248,14 @@ app-regress:       ## flip the REAL EC2 app expensive (fires culprit-App-High)
 app-recover:       ## turn the real app's chaos back off (do not skip this)
 	@./scripts/chaos.sh off
 	@echo "app back to baseline."
+
+# Source-level regression: a real commit on Tehreem404/bad_app_demo's main,
+# not a runtime knob. Idempotent — see scripts/regress_commit.sh's header.
+regress-commit:     ## plant the culprit commit on bad_app_demo main (git push)
+	@./scripts/regress_commit.sh apply
+
+revert-commit:      ## git revert the culprit commit on bad_app_demo main (git push)
+	@./scripts/regress_commit.sh revert
 
 calibrate:         ## derive the alarm threshold from real observed data
 	@./scripts/calibrate.sh

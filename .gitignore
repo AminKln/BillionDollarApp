@@ -17,5 +17,5 @@ cdk.out/
 .DS_Store
 Thumbs.db
 
-# local process state (pids, logs from scripts/seed_metrics.py)
+# local deploy scratch (last-used threshold etc.)
 .run/

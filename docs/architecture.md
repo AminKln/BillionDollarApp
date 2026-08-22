@@ -31,7 +31,7 @@
 > 2. **Chaos is not HTTP.** Anywhere this doc implies `curl /chaos/...`, the
 >    real app reads SSM Parameter Store on every request. Use `make app-regress`
 >    / `make app-recover`, which drive `scripts/chaos.sh`. `decisions.md` §1.
-> 3. **The demo script in §9 is aspirational** (git push → auto-deploy →
+> 3. **The demo script in §7 is aspirational** (git push → auto-deploy →
 >    regression). The rehearsed, timed, actually-working run is
 >    `docs/runbook.md`. Run that one.
 > 4. **There is no synthetic feed.** Every mention below of namespace
@@ -73,6 +73,17 @@ real work being done badly, and the alarm fires on real datapoints.
 ---
 
 ## 1. The incident
+
+**Historical — describes a from-scratch app (`app/main.py`, `app/compute.py`,
+`POST /compute`) that was never built; `app/` does not exist in this repo.**
+The demo instead uses the real `Tehreem404/bad_app_demo` app, and tonight's
+actual trigger is the `cpu`/`latency` SSM chaos toggle, not a seeded git
+commit at all (`decisions.md` §1, §2). A real, not-currently-deployed
+regression patch for the originally-planned push-based path does exist —
+`infra/bad-app/culprit.py.patch`, adding an O(n²) `_rank_all`/`_score_request`
+to `bad_app_demo`'s `app.py` — but it is a different file, function, and
+endpoint than the ones named below. Kept for the shape of the argument (a
+real bug that passes tests and review), not for the specific paths.
 
 The whole project stands or falls on the quality of the regression. A
 `time.sleep()` toggled by a chaos endpoint is not a regression — it is a
@@ -315,13 +326,13 @@ The band still earns its place two other ways:
 
 1. It is a widget on the `Culprit` dashboard
    (`https://console.aws.amazon.com/cloudwatch/home?region=us-east-1#dashboards:name=Culprit`)
-   — eight widgets total: a header, the real app's latency against its
+   — **five widgets today**, down from eight before the synthetic side was
+   deleted (`decisions.md` §9): a header, the real app's latency against its
    expected band with the static threshold drawn in, an alarm-state panel
-   over all six alarms, `ErrorRate`, the EC2 host's CPU/mem/disk pulled in
-   via `SEARCH` so no instance ID is hardcoded, then this feed's own
-   `RequestLatency` against its band with its own static threshold, plus
-   `SystemLoad1` and a combined `WorkUnits`/`RequestCount` widget. It is the
-   visual that makes the regression obvious on stage.
+   over the three real alarms (`culprit-App-High`, `culprit-App-Anomaly`,
+   `culprit-App-ErrorRate`), `ErrorRate`, and the EC2 host's CPU/mem/disk
+   pulled in via `SEARCH` so no instance ID is hardcoded. It is the visual
+   that makes the regression obvious on stage.
 2. `gather_evidence.sh` queries the band expression directly via
    `get-metric-data`, so `INCIDENT.md` contains a line like
    `expected latency band: 34–48 ms; observed: 251 ms`. The agent cites it in
@@ -370,6 +381,9 @@ quietly.
 
 ### I1 — Metrics · W1 → W2
 
+**Historical — describes the deleted synthetic feed.** See the live
+contract below the table (`decisions.md` §9).
+
 Namespace `Culprit`. No dimensions on any metric in this namespace
 (dimensioned metrics do not match dimensionless alarms — this is what broke
 the old dashboard). That rule is `Culprit`-specific: the real app's metrics
@@ -408,52 +422,56 @@ become an 11th key. A sample lives at `docs/contracts/dispatch-payload.json`
 so W3 can replay it before the Lambda exists; the upstream EventBridge event
 the Lambda parses to produce it is at `docs/contracts/eventbridge-alarm-event.json`.
 
-One Lambda serves both feeds. `metric_name`, `namespace`, and the query
-period are read from `detail.configuration.metrics[].metricStat` on the
-EventBridge alarm-state-change event, not from Lambda environment variables
-— so the function always reports the metric that actually fired rather than
-one hardcoded per alarm. The sample below is a `Culprit`-feed alarm; a
-`HackathonDemo`-feed alarm produces the same shape with
-`"namespace": "HackathonDemo"`, `alarm_name` one of `culprit-App-High` /
-`culprit-App-Anomaly`, and `evidence` built from `ErrorRate`.
+One Lambda serves every alarm on the one real feed (it used to serve a
+second, synthetic feed too — `metric_name`, `namespace` and the query period
+are still read off the event rather than hardcoded, which is why deleting
+that feed cost zero Lambda changes). They come from
+`detail.configuration.metrics[].metricStat` on the EventBridge
+alarm-state-change event, so the function always reports the metric that
+actually fired. The sample below is captured **verbatim** from a real
+regression on the real app (`docs/contracts/dispatch-payload.json`, full
+provenance and caveats there):
 
 ```json
 {
-  "alarm_name":    "culprit-Latency-High",
-  "state_reason":  "Threshold Crossed: 2 out of 2 datapoints ...",
-  "timestamp":     "2026-08-22T09:14:02Z",
+  "alarm_name":    "culprit-App-High",
+  "state_reason":  "Threshold Crossed: 1 out of the last 1 datapoints [2.0601465613753707 (22/08/26 17:19:00)] was greater than the threshold (0.5) (minimum 1 datapoint for OK -> ALARM transition).",
+  "timestamp":     "2026-08-22T17:20:33.259+0000",
   "metric_name":   "RequestLatency",
-  "namespace":     "Culprit",
-  "threshold":     "95.0",
-  "datapoints":    "[251.3, 248.9, 40.2, 39.8]",
+  "namespace":     "HackathonDemo",
+  "threshold":     "0.5",
+  "datapoints":    "[2.0601465613753707]",
   "region":        "us-east-1",
-  "dashboard_url": "https://console.aws.amazon.com/cloudwatch/...",
-  "evidence":      "{\"RequestLatency\": {\"before\": 37.957, \"now\": 242.078, \"change\": \"+538%\"}, \"SystemLoad1\": {\"before\": 0.752, \"now\": 2.523, \"change\": \"+236%\"}, \"WorkUnits\": {\"before\": 4000.0, \"now\": 4000.0, \"change\": \"flat\"}, \"RequestCount\": {\"before\": 20.0, \"now\": 20.0, \"change\": \"flat\"}}"
+  "dashboard_url": "https://console.aws.amazon.com/cloudwatch/home?region=us-east-1#dashboards:name=Culprit",
+  "evidence":      "{\"HackathonDemo bad-app-ec2 ErrorRate\": {\"before\": 0.0, \"now\": 0.0, \"change\": \"flat\"}, \"HackathonDemo bad-app-ec2 RequestLatency\": {\"before\": 0.259, \"now\": 2.059, \"change\": \"+695%\"}, \"HackathonDemo/System cpu-total i-091814f7a41456cb0 cpu_usage_active\": {\"before\": 9.685, \"now\": 27.401, \"change\": \"+183%\"}, \"HackathonDemo/System i-091814f7a41456cb0 mem_used_percent\": {\"before\": 41.188, \"now\": 41.276, \"change\": \"flat\"}, \"HackathonDemo/System nvme0n1p1 xfs i-091814f7a41456cb0 / disk_used_percent\": {\"before\": 30.565, \"now\": 30.565, \"change\": \"flat\"}}"
 }
 ```
 
 `datapoints` and `evidence` are JSON-encoded **strings**, not objects — every
-`client_payload` value has to be a scalar.
+`client_payload` value has to be a scalar. `evidence`'s keys are fully
+qualified CloudWatch `SEARCH` labels (namespace, dimensions, metric name,
+space-separated), not bare metric names — match on the trailing token
+(`docs/contracts/dispatch-payload.json` §`_comment_evidence_keys`).
 
 `evidence` is the discriminator, and it is the reason the payload is worth more
 than an alert. The Lambda runs a single
-`SEARCH('Namespace="<ns>"', 'Average', <period>)` against whichever
-namespace raised the alarm and compares each metric it finds across two
-windows: `now` is the last ~30 s, `before` is the ~5 min preceding the
-incident. Both windows are expressed as *durations* and converted to
-datapoint counts from the alarm's own period (`max(1, 30 // p)` and
-`max(1, 300 // p)`), so they mean the same span whether the feed publishes
-every 10 s or every 60 s.
+`SEARCH('Namespace="<ns>" OR Namespace="<ns>/System"', 'Average', <period>)`
+against whichever namespace raised the alarm and compares each metric it
+finds across two windows: `now` is the last ~30 s, `before` is the ~5 min
+preceding the incident. Both windows are expressed as *durations* and
+converted to datapoint counts from the alarm's own period (`max(1, 30 // p)`
+and `max(1, 300 // p)`), so they mean the same span at any period.
 
 The sweep is namespace-wide and dimension-agnostic, which buys two things. A
-metric a teammate starts publishing into that namespace shows up in
-`evidence` with no Lambda redeploy. And the *firing* metric is swept in
-alongside the rest — so a `Culprit`-feed alarm yields `RequestLatency`,
-`SystemLoad1`, `WorkUnits` and `RequestCount`, and the agent learns the
-magnitude of the regression (`+538%` in the captured sample), not merely
-that a threshold was crossed. A `HackathonDemo`-feed alarm yields
-`RequestLatency` and `ErrorRate`; the host metrics live in the separate
-`HackathonDemo/System` namespace and are not swept in.
+metric a teammate starts publishing into `HackathonDemo` or
+`HackathonDemo/System` shows up in `evidence` with no Lambda redeploy — the
+`OR` is what pulls the CloudWatch agent's host metrics in alongside the
+app's own. And the *firing* metric is swept in alongside the rest, so the
+agent learns the magnitude of the regression (`+695%` in the captured
+sample above), not merely that a threshold was crossed. (Before the
+synthetic feed was deleted, a `Culprit`-feed alarm would sweep in
+`SystemLoad1`/`WorkUnits`/`RequestCount` instead — that comparison no longer
+applies; see `decisions.md` §9.)
 
 Latency and load rose; work and traffic did not move. That single object is
 what takes the agent from "something is slow" to "the same work on the same
@@ -469,12 +487,12 @@ Schema at `docs/contracts/verdict.schema.json`.
 
 ```json
 {
-  "action":            "pr",
-  "url":               "https://github.com/owner/repo/pull/42",
-  "suspect_sha":       "a1b2c3d",
-  "confidence":        0.9,
-  "metrics_that_moved": ["RequestLatency", "SystemLoad1"],
-  "metrics_flat":       ["WorkUnits", "RequestCount"],
+  "action":             "pr",
+  "url":                "https://github.com/AminKln/BillionDollarApp/pull/42",
+  "suspect_sha":        "a1b2c3d",
+  "confidence":         0.9,
+  "metrics_that_moved": ["RequestLatency", "cpu_usage_active"],
+  "metrics_flat":       ["ErrorRate", "mem_used_percent", "disk_used_percent"],
   "ruled_out":          ["e4f5g6h: refactor only, no complexity change"]
 }
 ```
@@ -482,6 +500,11 @@ Schema at `docs/contracts/verdict.schema.json`.
 `action` is one of `pr` | `issue` | `comment`. Anything else fails the run.
 
 ### I4 — Repo layout · W4 → W1
+
+**Historical — describes the original from-scratch app plan.** The build
+instead used the real `Tehreem404/bad_app_demo` app; the regression is
+`infra/bad-app/culprit.py.patch` against its `app.py` (`_rank_all` /
+`_score_request`), not `app/compute.py` (`decisions.md` §9).
 
 The regression lives in `app/compute.py` and nowhere else. W1 must keep the
 scoring logic in that file, in a function that can be edited in isolation, so
@@ -579,6 +602,12 @@ not exist yet.
 
 ## 6. Build order
 
+**Historical.** This table plans the original from-scratch app
+(`app/main.py`, the `Culprit` namespace, `culprit-Latency-High`,
+`scripts/seed_incident.sh`). The build instead reused the real
+`Tehreem404/bad_app_demo` app and `scripts/chaos.sh` — see `docs/decisions.md`
+§9. Kept for the shape of the schedule, not the commands in it.
+
 Times assume a 19:00 start and a demo the following morning. Adjust the
 offsets, keep the order.
 
@@ -617,12 +646,17 @@ Four tabs: CloudWatch dashboard on 10-second auto-refresh · GitHub Actions ·
 the repo's Pull requests tab · a terminal where `seed_incident.sh` has
 already run and `git push origin main` is typed but **not entered**.
 
-> **SUPERSEDED — do not run from this table.** It describes the aspirational
-> push-triggered demo (real bad commit → auto-deploy → regression). What is
-> built, rehearsed and timed is in **`docs/runbook.md`**: flip the app's `cpu`
-> chaos knob, alarm in 90s–3min, dispatch within 5s. Keep this as the target
-> for after the hackathon; the numbers and the `WorkUnits` pivot below are not
-> what the payload actually carries today.
+> **SUPERSEDED — do not run from this table, or from the Fallbacks list
+> below it.** It describes the aspirational push-triggered demo (real bad
+> commit → auto-deploy → regression). What is built, rehearsed and timed is
+> in **`docs/runbook.md`**: flip the app's `cpu` chaos knob, alarm in
+> 90s–3min, dispatch within 5s. Keep this as the target for after the
+> hackathon; the numbers, the `WorkUnits` pivot below, and the
+> `culprit-Latency-High` alarm name in the Fallbacks section are not what the
+> payload actually carries or what the stack actually alarms on today (the
+> real, three alarms are `culprit-App-High`/`-Anomaly`/`-ErrorRate` —
+> `decisions.md` §9). `docs/runbook.md`'s own "If it breaks on stage" table
+> is the fallback that actually works.
 
 | T | Do | Say |
 |---|---|---|
@@ -688,13 +722,13 @@ trained detector, and a webhook receiver. CloudWatch gives us the metric
 store, the trained model, and the event bus as one resource each. The
 interesting engineering is not in the collector.
 
-**"What does it cost to run?"** Six custom metrics across two namespaces,
-three host metrics from the CloudWatch agent, six alarms, two anomaly
-detectors (one per feed), and one Lambda — the same function handles every
-alarm on either feed. One invocation per incident (the dedup check absorbs
-the case where both alarms on a feed fire), one Actions runner-minute per
-incident. The only meaningful cost is the agent session, and it only runs
-when an alarm fires.
+**"What does it cost to run?"** Two custom metrics (`RequestLatency`,
+`ErrorRate`) on `HackathonDemo`, three host metrics from the CloudWatch agent
+on `HackathonDemo/System`, three alarms, one anomaly detector, and one
+Lambda — the same function handles every alarm. One invocation per incident
+(the dedup check absorbs the case where both alarms fire), one Actions
+runner-minute per incident. The only meaningful cost is the agent session,
+and it only runs when an alarm fires.
 
 **"The agent has write access to your repo."** A classic PAT scoped to one
 repo with a one-day expiry, which only ever pushes to `auto-fix/*` branches

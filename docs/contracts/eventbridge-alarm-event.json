@@ -1,5 +1,5 @@
 {
-  "_comment": "I2-upstream. A realistic, hand-shaped capture of the EventBridge \"CloudWatch Alarm State Change\" event that the culprit-alarm-state-change rule routes to the culprit-dispatch Lambda when culprit-Latency-High transitions to ALARM. Lets the Lambda be unit-tested offline with zero AWS calls. IMPORTANT: detail.state.reasonData (and detail.previousState.reasonData) is deliberately a STRING, not a nested object -- CloudWatch always JSON-encodes it as a string, which is exactly why the Lambda needs a real json.loads() and why a plain EventBridge input transformer cannot read it (docs/architecture.md §2, \"A Lambda, not an EventBridge API Destination\"). This file's datapoints, threshold and timestamps are illustrative only and are NOT kept in sync with the live example in docs/contracts/dispatch-payload.json -- that file is refreshed from real culprit-dispatch CloudWatch Logs output and will drift from whatever numbers are hand-shaped here. Treat this file as a shape/schema fixture (what the Lambda parses: reasonData as a JSON string, recentDatapoints, threshold, timestamp) rather than a value-for-value match to the dispatch payload example.",
+  "_comment": "I2-upstream. A realistic, hand-shaped capture of the EventBridge \"CloudWatch Alarm State Change\" event that the culprit-alarm-state-change rule routes to the culprit-dispatch Lambda when culprit-App-High transitions to ALARM. Lets the Lambda be unit-tested offline with zero AWS calls. IMPORTANT: detail.state.reasonData (and detail.previousState.reasonData) is deliberately a STRING, not a nested object -- CloudWatch always JSON-encodes it as a string, which is exactly why the Lambda needs a real json.loads() and why a plain EventBridge input transformer cannot read it (docs/architecture.md §2, \"A Lambda, not an EventBridge API Destination\"). This file's datapoints, threshold and timestamps are illustrative only and are NOT kept in sync with the live example in docs/contracts/dispatch-payload.json -- that file is refreshed from real culprit-dispatch CloudWatch Logs output and will drift from whatever numbers are hand-shaped here. Treat this file as a shape/schema fixture (what the Lambda parses: reasonData as a JSON string, recentDatapoints, threshold, timestamp) rather than a value-for-value match to the dispatch payload example. Namespace/alarm/unit below match the real EC2 app (HackathonDemo, RequestLatency in seconds, dimension App=bad-app-ec2) -- a synthetic feed in namespace=Culprit used to also produce this shape via culprit-Latency-High; it was deleted (docs/decisions.md §9).",
   "version": "0",
   "id": "6a7e8f21-4b3d-4c9a-9e2f-1d5c8a7b6e42",
   "detail-type": "CloudWatch Alarm State Change",
@@ -8,20 +8,20 @@
   "time": "2026-08-22T09:14:02Z",
   "region": "us-east-1",
   "resources": [
-    "arn:aws:cloudwatch:us-east-1:537124932895:alarm:culprit-Latency-High"
+    "arn:aws:cloudwatch:us-east-1:537124932895:alarm:culprit-App-High"
   ],
   "detail": {
-    "alarmName": "culprit-Latency-High",
+    "alarmName": "culprit-App-High",
     "state": {
       "value": "ALARM",
-      "reason": "Threshold Crossed: 2 out of 2 datapoints [251.34 (22/08/26 09:14:00), 248.91 (22/08/26 09:13:50)] were greater than the threshold (95.0).",
-      "reasonData": "{\"version\":\"1.0\",\"queryDate\":\"2026-08-22T09:14:02.451+0000\",\"startDate\":\"2026-08-22T09:13:50.000+0000\",\"unit\":\"Milliseconds\",\"statistic\":\"Average\",\"period\":10,\"recentDatapoints\":[251.34,248.91],\"threshold\":95.0,\"evaluatedDatapoints\":[{\"timestamp\":\"2026-08-22T09:14:00.000+0000\",\"sampleCount\":20.0,\"value\":251.34}]}",
+      "reason": "Threshold Crossed: 1 out of 1 datapoints [2.06 (22/08/26 09:14:00)] were greater than the threshold (0.34).",
+      "reasonData": "{\"version\":\"1.0\",\"queryDate\":\"2026-08-22T09:14:02.451+0000\",\"startDate\":\"2026-08-22T09:13:00.000+0000\",\"unit\":\"Seconds\",\"statistic\":\"Average\",\"period\":60,\"recentDatapoints\":[2.06],\"threshold\":0.34,\"evaluatedDatapoints\":[{\"timestamp\":\"2026-08-22T09:14:00.000+0000\",\"sampleCount\":6.0,\"value\":2.06}]}",
       "timestamp": "2026-08-22T09:14:02.451+0000"
     },
     "previousState": {
       "value": "OK",
-      "reason": "Threshold Crossed: no datapoints were greater than the threshold (95.0).",
-      "reasonData": "{\"version\":\"1.0\",\"queryDate\":\"2026-08-22T09:04:02.113+0000\",\"startDate\":\"2026-08-22T09:03:50.000+0000\",\"unit\":\"Milliseconds\",\"statistic\":\"Average\",\"period\":10,\"recentDatapoints\":[40.22,39.87],\"threshold\":95.0,\"evaluatedDatapoints\":[{\"timestamp\":\"2026-08-22T09:04:00.000+0000\",\"sampleCount\":20.0,\"value\":40.22}]}",
+      "reason": "Threshold Crossed: no datapoints were greater than the threshold (0.34).",
+      "reasonData": "{\"version\":\"1.0\",\"queryDate\":\"2026-08-22T09:04:02.113+0000\",\"startDate\":\"2026-08-22T09:03:00.000+0000\",\"unit\":\"Seconds\",\"statistic\":\"Average\",\"period\":60,\"recentDatapoints\":[0.05],\"threshold\":0.34,\"evaluatedDatapoints\":[{\"timestamp\":\"2026-08-22T09:04:00.000+0000\",\"sampleCount\":6.0,\"value\":0.05}]}",
       "timestamp": "2026-08-22T09:04:02.113+0000"
     },
     "configuration": {
@@ -31,11 +31,13 @@
           "id": "88d19c0a-1111-4c3d-9a2b-metricalarm01",
           "metricStat": {
             "metric": {
-              "namespace": "Culprit",
+              "namespace": "HackathonDemo",
               "name": "RequestLatency",
-              "dimensions": {}
+              "dimensions": {
+                "App": "bad-app-ec2"
+              }
             },
-            "period": 10,
+            "period": 60,
             "stat": "Average"
           },
           "returnData": true

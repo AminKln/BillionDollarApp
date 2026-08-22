@@ -1,0 +1,49 @@
+--- a/context_builder.py
++++ b/context_builder.py
+@@ -114,17 +114,41 @@
+         raise ValueError(f"No alarm found named {alarm_name!r}")
+     a = alarms[0]
+ 
++    if "Namespace" in a:
++        # Simple, single-metric alarm -- Namespace/MetricName/Dimensions/
++        # Period/Threshold all live at the top level.
++        namespace = a["Namespace"]
++        metric_name = a["MetricName"]
++        dimensions = {d["Name"]: d["Value"] for d in a.get("Dimensions", [])}
++        period_seconds = a["Period"]
++        threshold = a.get("Threshold")
++    else:
++        # Metric-math alarm (e.g. ANOMALY_DETECTION_BAND) -- there's no
++        # single top-level metric; it's one of several entries in Metrics[].
++        # Find the one with a MetricStat (the underlying metric query, not
++        # the anomaly-band expression) and pull namespace/metric/dims/period
++        # from there. No fixed Threshold exists -- the band is dynamic.
++        metric_query = next((m for m in a.get("Metrics", []) if "MetricStat" in m), None)
++        if metric_query is None:
++            raise ValueError(f"Alarm {alarm_name!r} has no MetricStat in its Metrics -- can't determine its metric")
++        metric = metric_query["MetricStat"]["Metric"]
++        namespace = metric["Namespace"]
++        metric_name = metric["MetricName"]
++        dimensions = {d["Name"]: d["Value"] for d in metric.get("Dimensions", [])}
++        period_seconds = metric_query["MetricStat"]["Period"]
++        threshold = None
++
+     return AlarmDetails(
+         name=a["AlarmName"],
+         description=a.get("AlarmDescription"),
+         state_reason=a.get("StateReason", ""),
+         state_updated=a["StateUpdatedTimestamp"],
+-        namespace=a["Namespace"],
+-        metric_name=a["MetricName"],
+-        dimensions={d["Name"]: d["Value"] for d in a.get("Dimensions", [])},
++        namespace=namespace,
++        metric_name=metric_name,
++        dimensions=dimensions,
+         comparison_operator=a["ComparisonOperator"],
+-        threshold=a["Threshold"],
+-        period_seconds=a["Period"],
++        threshold=threshold,
++        period_seconds=period_seconds,
+     )
+ 
+ 
