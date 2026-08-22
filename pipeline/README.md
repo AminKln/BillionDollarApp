@@ -1,7 +1,107 @@
-# pipeline/ -- context builder for automated anomaly diagnosis
+# pipeline/ -- context builder + LLM diagnosis for a fired anomaly
 
-Given a fired CloudWatch alarm (an SNS message, or just its name), builds a
-single natural-language prompt string combining:
+## Quickstart for the anomaly-detection side
+
+This is the one function you need:
+
+```python
+from diagnose import diagnose
+
+result = diagnose(event)   # -> Claude's full root-cause diagnosis, as a string
+```
+
+### 1. Set up (once)
+
+```bash
+pip install -r pipeline/requirements.txt   # boto3, anthropic
+export ANTHROPIC_API_KEY=sk-ant-...        # ask for this if you don't have it -- it's in the project's .env
+```
+That's it. AWS creds come from whatever you already have configured
+(`aws configure` / instance role) -- no separate setup for those.
+
+### 2. Verify it works, right now, before wiring anything up
+
+```bash
+cd pipeline
+python3 diagnose.py culprit-App-Anomaly
+```
+If this prints a real diagnosis (a few paragraphs of hypothesis + suspect
+code + suggested fix), you're set. It takes maybe 10-30 seconds -- it's
+doing a live AWS lookup, a git clone, and a real Claude call, not a canned
+response.
+
+### 3. Call it from your code
+
+`diagnose()` takes **one required argument** -- `event` -- and accepts
+whatever shape your detection code has on hand:
+
+```python
+from diagnose import diagnose
+
+# a) just the alarm name (simplest -- fetches the alarm's current live state)
+diagnose("culprit-App-Anomaly")
+
+# b) a parsed CloudWatch alarm-state-change message (the shape SNS delivers --
+#    see docs/contracts/alarm-sns-message.json at the repo root for every field)
+diagnose({
+    "AlarmName": "culprit-App-Anomaly",
+    "NewStateValue": "ALARM",
+    "NewStateReason": "Thresholds Crossed: ...",
+    "StateChangeTime": "2026-08-22T17:52:28.788+0000",
+    # ...other CloudWatch fields are fine to include but not required
+})
+
+# c) the raw event your Lambda/handler receives if SNS invokes you directly
+def lambda_handler(event, context):
+    return diagnose(event)   # event["Records"][0]["Sns"]["Message"] is unwrapped automatically
+```
+Prefer (b)/(c) over (a) when you have them: `describe_alarms` only reports
+an alarm's *current* state, and this alarm flaps `ALARM <-> OK` in
+practice -- if your detector already knows the alarm just went to `ALARM`,
+passing that along (not just the name) guarantees the diagnosis is about
+*that* incident, not whatever the alarm happens to be doing by the time
+`diagnose()` runs.
+
+**No config needed beyond the API key** -- `GIT_REPO_PATH`/`INSTANCE_ID`/
+`AWS_REGION` all default to this project's fixed demo target. It also
+works when imported from any directory or file location (`sys.path` is
+handled internally) -- verified by loading it via `importlib` from an
+unrelated directory with nothing else set up, and getting a correct
+diagnosis back.
+
+### 4. What you get back
+
+A **plain string** -- Claude's full diagnosis in prose/markdown (hypothesis,
+supporting evidence, suspect file/line, suggested fix, and a confidence
+note), not JSON and not a dataclass. Print it, log it, email it, post it to
+Slack, whatever your detection side needs to do with it. See "Sample
+diagnosis" below for a full real example of exactly what comes back.
+
+### 5. If something goes wrong
+
+`diagnose()` doesn't swallow errors -- a broken run raises, it doesn't
+return `None` or an empty string. The likely causes, in order of
+probability:
+- **`KeyError` / `ValueError` on the alarm name** -- the alarm name is
+  wrong or doesn't exist in the account/region you're pointed at.
+- **`anthropic.AuthenticationError`** -- `ANTHROPIC_API_KEY` isn't set or is
+  invalid.
+- **`botocore` credential errors** -- AWS creds aren't configured in this
+  environment.
+- **A `git`/`RuntimeError` failure** -- couldn't clone/read the target repo
+  (network issue, or `GIT_REPO_PATH` was overridden to something invalid).
+
+Wrap the call in a `try/except` on your side if you want the detection loop
+to keep running after a failed diagnosis rather than crashing it.
+
+---
+
+Everything below this point is how the pieces `diagnose()` calls work
+internally, for anyone editing the pipeline itself rather than just calling
+it.
+
+Given a fired CloudWatch alarm (an SNS message, or just its name), the
+modules below build a single natural-language prompt string combining:
 
 - **Real CloudWatch evidence** -- the alarm's own definition, metric
   datapoints around the trigger, EC2 instance metadata, and log lines if a
@@ -23,12 +123,15 @@ of omitting it silently or making something up.
 
 ## Files
 
+- `diagnose.py` -- **the integration point.** `diagnose(event) -> str` wraps
+  everything below into one call to Claude and returns the diagnosis text.
+  Also runnable standalone: `python3 diagnose.py <alarm_name_or_sns_file>`.
 - `cloudwatch_context.py` -- alarm / metric / EC2 / log collector
   (`build_cloudwatch_context`)
 - `code_context.py` -- full-codebase + README + latest-commit collector
   (`build_code_context`)
-- `build_prompt.py` -- combines both into the final prompt string
-  (`build_diagnosis_prompt`)
+- `build_prompt.py` -- combines both into the prompt string `diagnose()`
+  sends to Claude (`build_diagnosis_prompt`) -- doesn't call an LLM itself
 - `sample_sns_message.json` -- a real alarm-state-change payload, captured
   from this project's own live `culprit-App-Anomaly` alarm via
   `aws cloudwatch describe-alarm-history`
@@ -37,9 +140,10 @@ of omitting it silently or making something up.
 
 | Var | Required | Meaning |
 |---|---|---|
-| `AWS_REGION` | recommended | region for all CloudWatch/EC2 calls (default `us-east-1`) |
-| `GIT_REPO_PATH` | yes (or pass `--git-repo`) | local checkout path, or a clone URL -- cloned to a temp dir if it doesn't exist locally |
-| `INSTANCE_ID` | if you want host metadata | EC2 instance the app runs on. Not inferred from alarm dimensions by default -- this project's alarms key off an `App` dimension (e.g. `App=bad-app-ec2`), not `InstanceId` |
+| `ANTHROPIC_API_KEY` | yes, for `diagnose()` | only needed to actually call Claude -- `build_prompt.py`/`build_diagnosis_prompt()` alone don't need it |
+| `AWS_REGION` | no | region for all CloudWatch/EC2 calls; `diagnose()` defaults to `us-east-1`, `build_diagnosis_prompt()` alone also defaults to `us-east-1` |
+| `GIT_REPO_PATH` | no, via `diagnose()` | local checkout path, or a clone URL -- cloned to a temp dir if it doesn't exist locally. `diagnose()` defaults to this project's `bad_app_demo` repo if unset; calling `build_diagnosis_prompt()` directly still requires it |
+| `INSTANCE_ID` | no, via `diagnose()` | EC2 instance the app runs on, for host metadata. Not inferred from alarm dimensions -- this project's alarms key off an `App` dimension (e.g. `App=bad-app-ec2`), not `InstanceId`. `diagnose()` defaults to this project's demo instance if unset |
 | `LOG_GROUP` | no | CloudWatch Logs group to sample around the trigger window; omitted entirely (with a note) if unset |
 | `LOOKBACK_MINUTES` / `LOOKAHEAD_MINUTES` | no | metric window around the trigger, default `30`/`5` |
 
@@ -57,25 +161,27 @@ resolution -- nothing is hardcoded.
 
 ```bash
 pip install -r requirements.txt   # boto3, anthropic
-
-export AWS_REGION=us-east-1
-export INSTANCE_ID=i-091814f7a41456cb0
-export GIT_REPO_PATH=https://github.com/Tehreem404/bad_app_demo.git
+export ANTHROPIC_API_KEY=...      # only thing required -- everything else defaults
 
 # by alarm name (fetches the alarm's current live state):
-python3 build_prompt.py culprit-App-Anomaly
+python3 diagnose.py culprit-App-Anomaly
 
 # or against a real SNS alarm message (its NewStateValue/StateChangeTime win
 # over the live state -- important for a flapping alarm, see note below):
-python3 build_prompt.py sample_sns_message.json
+python3 diagnose.py sample_sns_message.json
 ```
 
-Or from code:
+Or from code -- this is what `diagnose()` does internally, useful if you
+want the prompt without calling an LLM (e.g. to eyeball the evidence, or to
+send it somewhere other than Claude):
 
 ```python
 from build_prompt import build_diagnosis_prompt
 
-prompt = build_diagnosis_prompt(sns_message, git_repo_path="...")
+prompt = build_diagnosis_prompt(
+    sns_message,
+    git_repo_path="https://github.com/Tehreem404/bad_app_demo.git",
+)
 
 import anthropic
 client = anthropic.Anthropic()

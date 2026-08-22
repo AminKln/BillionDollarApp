@@ -39,8 +39,18 @@ checking git history/branch — neither doc set (`README.md`/
   `docs/architecture.md` §2/§7).
 - Deployed via SAM (`template.yaml`, `scripts/deploy.sh`).
 
-**2. `pipeline/` — a standalone context-builder + prompt assembler, not
+**2. `pipeline/` — a standalone context-builder + LLM diagnosis, not
 Lambda-deployed, no docs update yet:**
+- `pipeline/diagnose.py` — **the integration point for the anomaly-detection
+  side.** `diagnose(event) -> str` wraps everything below into one call:
+  give it whatever the detector produces (alarm name, alarm-message dict,
+  raw SNS envelope, or a JSON string of one) and it returns Claude's full
+  diagnosis as text. Defaults `GIT_REPO_PATH`/`INSTANCE_ID`/`AWS_REGION` to
+  this project's fixed demo target so the caller only needs
+  `ANTHROPIC_API_KEY` set — no other config required. Bootstraps its own
+  `sys.path` so it resolves correctly when imported from any directory
+  (verified via `importlib` from an unrelated directory with nothing else
+  on the path).
 - `pipeline/cloudwatch_context.py` — real CloudWatch alarm definition
   (handles both classic-threshold and metric-math/anomaly-detection alarm
   shapes), metric datapoints around the trigger, EC2 instance metadata
@@ -79,17 +89,20 @@ There is no test suite or linter in this repo. Dependency manifests:
 Lambda runtime), `infra/demo-app/requirements.txt` (`flask`, `boto3`), and
 `pipeline/requirements.txt` (`boto3`, `anthropic`).
 
-**Build a diagnosis prompt with `pipeline/` (needs real AWS creds; git repo
-can be a local checkout or a clone URL, cloned automatically):**
+**Get a real diagnosis from `pipeline/` (needs real AWS creds +
+`ANTHROPIC_API_KEY`; everything else defaults to this project's demo
+target):**
 ```bash
 pip install -r pipeline/requirements.txt
 cd pipeline
-AWS_REGION=us-east-1 INSTANCE_ID=<id> GIT_REPO_PATH=https://github.com/Tehreem404/bad_app_demo.git \
-  python3 build_prompt.py <alarm_name_or_path_to_sns_message.json>
+ANTHROPIC_API_KEY=... python3 diagnose.py <alarm_name_or_path_to_sns_message.json>
 ```
+Or as a library call — this is the integration point for whoever builds the
+anomaly-detection side: `from diagnose import diagnose; diagnose(event)`.
+
 See `pipeline/README.md` for the full env var list and a real sample of the
-assembled prompt. This only builds the prompt string — sending it to Claude
-(`ANTHROPIC_API_KEY`) is left to the caller, per the module docstring in
+assembled prompt. `build_prompt.py`/`build_diagnosis_prompt()` alone only
+builds the prompt string without calling Claude, per the module docstring in
 `pipeline/build_prompt.py`.
 
 **Deploy the SAM-based `lambda/` pipeline:**
