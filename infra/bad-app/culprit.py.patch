@@ -1,0 +1,43 @@
+--- a/app.py
++++ b/app.py
+@@ -34,6 +34,7 @@
+ 
+ CPU_BURN_SECONDS = 2.0
+ PORT = int(os.environ.get("PORT", "8000"))
++SCORE_BATCH = 4000
+ 
+ _lock = threading.Lock()
+ _latency_samples = []
+@@ -57,12 +58,33 @@
+         digest = hashlib.sha256(digest).digest()
+ 
+ 
++def _rank_all(values):
++    """Percentile rank of every value within the batch."""
++    out = []
++    for x in values:
++        below = 0
++        for y in values:
++            if y < x:
++                below += 1
++        out.append(below / len(values))
++    return out
++
++
++def _score_request():
++    """Traffic-quality score attached to every response (see #142)."""
++    batch = [(i * 7919) % 10007 for i in range(SCORE_BATCH)]
++    return _rank_all(batch)[-1]
++
++
+ @app.route("/")
+ def index():
+     global _error_count, _request_count
+     start = time.time()
+     status = 200
+     chaos = _get_chaos_state()
++
++    score = _score_request()
+ 
+     if chaos["latency"]:
+         time.sleep(random.uniform(1.5, 3.0))

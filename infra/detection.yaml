@@ -89,8 +89,18 @@ Parameters:
       sleeps 1.5-3.0s, so 0.5 sits clear of both.
   LatencySensitivity:
     Type: Number
-    Default: 2
-    Description: Standard deviations wide for ANOMALY_DETECTION_BAND.
+    Default: 8
+    Description: >
+      Standard deviations wide for ANOMALY_DETECTION_BAND. Was 2, which
+      produced continuous FALSE POSITIVES on 2026-08-22: the healthy app's
+      latency barely varies (0.051-0.054s), so 2 stdev put the band top at
+      0.052 - BELOW the live baseline - and culprit-App-Anomaly flapped
+      OK->ALARM four times in 16 minutes with no chaos running, dispatching
+      each time. Measured band tops at the observed baseline: w2=0.052 (breached),
+      w4=0.055 (marginal), w6=0.058, w8=0.061, w10=0.064. 8 leaves ~13% headroom.
+      Widening costs nothing in detection: the chaos regression averages 2.06s,
+      which is ~32x the w8 band top. Narrow this again only after the detector
+      leaves TRAINED_INSUFFICIENT_DATA (needs days, not hours, of history).
 
   GithubOwner:
     Type: String
@@ -180,8 +190,11 @@ Resources:
       AlarmDescription: RequestLatency outside its CloudWatch-modeled expected band.
       ActionsEnabled: true
       ComparisonOperator: GreaterThanUpperThreshold
-      EvaluationPeriods: 2
-      DatapointsToAlarm: 2
+      # 3-of-3 for the same reason as culprit-App-Anomaly below: a 2-stdev
+      # band over a low-variance metric false-positives, and this alarm
+      # flapped OK->ALARM at 15:20Z with nothing wrong.
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
       ThresholdMetricId: ad1
       # "missing", not "notBreaching": an untrained band (see constraint #2
       # above) leaves this alarm in INSUFFICIENT_DATA for the first 3+
@@ -304,12 +317,21 @@ Resources:
       AlarmDescription: EC2 demo app latency outside its modeled expected band.
       ActionsEnabled: true
       ComparisonOperator: GreaterThanUpperThreshold
-      EvaluationPeriods: 2
-      DatapointsToAlarm: 2
+      # 3-of-3, not 2-of-2. At a 60s period this means the band must be breached
+      # for three consecutive minutes, which does two things. It kills the
+      # flapping described on LatencySensitivity, and it guarantees the 1-of-1
+      # static alarm (culprit-App-High) always wins the race to fire - so the
+      # dispatch Lambda's dedup works as designed and one regression produces
+      # ONE dispatch. On 2026-08-22 this band beat the threshold by 5s and both
+      # dispatched. Detection speed is unaffected: -High still fires in ~1 min
+      # and it is the one that carries the demo.
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
       ThresholdMetricId: ad2
-      # This band needs ~3h of history and the box only came up at 13:53Z, so
-      # expect INSUFFICIENT_DATA until roughly 17:00Z. "missing" keeps that
-      # visible rather than reporting a comfortable OK over an untrained band.
+      # The detector still reports TRAINED_INSUFFICIENT_DATA - CloudWatch wants
+      # days of history and has hours. It produces a usable band anyway, but a
+      # drifting mean is exactly why the width above is generous. "missing"
+      # keeps an untrained band visible rather than reporting a comfortable OK.
       TreatMissingData: missing
       Metrics:
         - Id: m2
@@ -626,10 +648,15 @@ Resources:
           # Ref on AWS::CloudWatch::Alarm returns the alarm NAME, so this
           # stays correct even if AlarmName above ever changes.
           alarmName:
-            - !Ref LatencyHighAlarm
-            - !Ref LatencyAnomalyAlarm
+            # REAL APP ONLY. The two culprit-Latency-* alarms watch the
+            # `Culprit` namespace, which is scripts/seed_metrics.py making up
+            # numbers with random.lognormvariate -- no app, no HTTP, no work.
+            # They stay deployed as a dashboard fallback if the shared EC2 box
+            # dies, but they must never reach the agent: a PR written about
+            # fabricated latency is worse than no PR. See decisions.md 4 and 8.
             - !Ref AppLatencyHighAlarm
             - !Ref AppLatencyAnomalyAlarm
+            - !Ref AppErrorRateAlarm
           state:
             value:
               - ALARM

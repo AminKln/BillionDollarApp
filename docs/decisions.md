@@ -174,13 +174,18 @@ ALARM. In rehearsal #2 the band tripped **5 seconds before** the threshold —
 `Anomaly` at 17:20:28, `High` at 17:20:33 — so the dedup had nothing to check
 against and **both dispatched**.
 
-**Decision: leave it, and make the consumer idempotent.** Three reasons. The
-Lambda's inline source is at **4095 of CloudFormation's 4096-byte limit**, so
-there is physically no room to extend the dedup. Retuning the anomaly alarm's
-evaluation windows so it always loses the race is fragile and would need
-re-baselining hours before the demo. And on stage, two alarms catching the same
-regression by two different methods is a point in our favour — two *pull
-requests* is not.
+**Superseded by §8 — fixed at the alarm layer instead.** The original decision
+was to leave it and make the consumer idempotent, because the Lambda's inline
+source is at **4095 of CloudFormation's 4096-byte limit** and there is no room
+to extend the dedup. But §8 had to retune the anomaly alarm anyway, and raising
+it to 3-of-3 at a 60s period means it now needs **three minutes** to fire while
+`culprit-App-High` is 1-of-1 and fires in **one**. The anomaly alarm can no
+longer win the race, so the Lambda's existing "drop -Anomaly if -High is already
+ALARM" dedup works as designed and one regression produces one dispatch. Cost:
+zero bytes — alarm properties live outside `ZipFile`.
+
+**W3 should still be idempotent** — belt and braces, and it is two lines of
+`concurrency:`. But it is no longer load-bearing.
 
 **W3:** dedupe on `metric_name` + a short window (60s is plenty), or make the
 PR/issue creation idempotent on the alarm's `timestamp`. Documented with the
@@ -200,3 +205,59 @@ real capture in `contracts/dispatch-payload.json`.
   that can write there (§6).
 - **Everyone:** the demo trigger is `make app-regress` (cpu knob). Always
   finish with `make app-recover` — it is a shared box.
+
+---
+
+## 8. The anomaly band was firing on healthy traffic. Fixed.
+
+Found while answering "does the ML arm have enough baseline yet?" The answer
+turned out to be worse than "not yet."
+
+`culprit-App-Anomaly` was **in ALARM with no chaos running**, and had flapped
+OK→ALARM **four times in sixteen minutes**. It had already fired **three
+spurious dispatches**, whose own evidence block read `RequestLatency 0.053 ->
+0.056 flat`. With a `GITHUB_TOKEN` on the stack that is three junk PRs in eight
+minutes, discovered on stage.
+
+**Why.** The healthy app is *too stable*. `RequestLatency` Average sits in
+0.051–0.054s, so 1σ ≈ 0.0015. At the configured `ANOMALY_DETECTION_BAND(m2, 2)`
+the band was only ±0.003 wide. The model's mean (~0.049) was learned from
+early-morning traffic while the live baseline had drifted up ~5% — and 5% drift
+is more than a ±6% band can absorb. **The band top sat below live healthy
+traffic**, so healthy traffic read as anomalous, permanently.
+
+Measured band tops against the observed baseline:
+
+| width | band top | vs healthy peak 0.054 |
+|---|---|---|
+| 2 | 0.052 | **breached continuously** |
+| 4 | 0.055 | marginal |
+| 6 | 0.058 | ok |
+| **8** | **0.061** | **~13% headroom** ← chosen |
+| 10 | 0.064 | ok |
+
+**Widening costs nothing in detection.** The regression averages ~2.06s, which
+is ~32× the width-8 band top. There is no width in this table that would miss
+it. The band is not what catches the regression — the 0.5s static threshold is,
+and it fires in one minute.
+
+Also raised both anomaly alarms to **3-of-3** datapoints, which kills the
+flapping and (see §7) makes the double dispatch structurally impossible.
+
+**Narrow it again only when the detectors leave `TRAINED_INSUFFICIENT_DATA`.**
+Both still report that state — CloudWatch wants days of history and has hours.
+
+## 9. Three of the six alarms were watching fabricated data
+
+`culprit-Latency-High`, `culprit-Latency-Anomaly` and `culprit-Load-High` are on
+the **`Culprit`** namespace, which is `scripts/seed_metrics.py` generating
+numbers with `random.lognormvariate`. No app, no HTTP, no work. Only
+`culprit-App-High`, `culprit-App-Anomaly` and `culprit-App-ErrorRate` are on
+`HackathonDemo`, the real app's own `put_metric_data`.
+
+All four dispatch-eligible alarms in the EventBridge rule used to include the
+two synthetic ones. **They are now excluded from the rule**, and
+`culprit-App-ErrorRate` was added in their place. The synthetic alarms stay
+deployed and stay on the dashboard as a fallback rig if the shared EC2 box dies
+mid-demo — but they can no longer reach the agent. A PR written about invented
+latency is worse than no PR.
