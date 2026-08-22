@@ -1,12 +1,17 @@
 {
   "_contract": "review-result",
-  "_description": "Structured JSON lambda/llm_review.py asks Bedrock (Claude) to return. Rendered by lambda/notify.py into the CloudWatch custom widget and the SNS email.",
-  "suspect_commit": "a1b2c3d",
-  "confidence": 0.87,
-  "explanation": "Commit a1b2c3d removed the retry cap in bad_app.py's downstream call handling, allowing unbounded retries under load. This aligns with the latency spike observed starting at 14:32Z.",
-  "suggested_fix": {
-    "summary": "Re-add the retry cap / backoff limit removed in a1b2c3d.",
-    "diff": "--- a/infra/demo-app/bad_app.py\n+++ b/infra/demo-app/bad_app.py\n@@ -10,7 +10,7 @@\n-        time.sleep(random.uniform(1.5, 3.0))\n+        time.sleep(random.uniform(0.01, 0.05))",
-    "risk_note": "This mitigation restores prior behavior but doesn't address why the retry cap was removed in the first place — confirm nothing else relies on the longer timeout before shipping."
-  }
+  "_description": "Structured JSON agent/llm_agent.py asks Claude (direct Anthropic API) to return, grounded in the alarm's CloudWatch metric + log evidence plus codebase context fetched from GitHub. This is what agent/handler.py logs and returns as its invocation result.",
+  "hypothesis": "The 5XX spike is driven by upstream connectivity failures (502 Bad Gateway / connection reset) rather than database exhaustion, consistent with the known pattern of external payment-gateway outages causing 5XXs without accompanying DB errors.",
+  "confidence": "medium",
+  "supporting_evidence": [
+    {
+      "source": "alarm:checkout-5xx-spike",
+      "excerpt": "Threshold Crossed: 62.0 > 10.0 at 2026-08-21T16:05:00+00:00"
+    },
+    {
+      "source": "log:error_sample",
+      "excerpt": "502 Bad Gateway: upstream connect error or disconnect/reset before headers"
+    }
+  ],
+  "suggested_action": "Check upstream/payment gateway health and connectivity logs around 16:04-16:06 UTC, and confirm no corresponding Npgsql/DB timeout errors to rule out DB pool exhaustion versus external upstream failure."
 }

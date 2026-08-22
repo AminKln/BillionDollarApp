@@ -6,6 +6,7 @@ resolve_s3 = true
 capabilities = "CAPABILITY_IAM"
 confirm_changeset = true
 region = "us-east-1"
-# GithubOwner / GithubRepo / GithubToken / NotifyEmail are intentionally not
-# set here — pass them via `sam deploy --parameter-overrides ...` (see
-# scripts/deploy.sh) so no secret ever lands in this checked-in file.
+# AnthropicApiKey / LogGroupName / GithubOwner / GithubRepo / GithubRef /
+# GithubToken are intentionally not set here — pass them via
+# `sam deploy --parameter-overrides ...` (see scripts/deploy.sh) so no
+# secret ever lands in this checked-in file.

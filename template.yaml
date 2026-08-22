@@ -1,148 +1,110 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
 Description: >
-  Anomaly Detection -> LLM Code Review & Fix Agent (CloudWatch-native).
-  See docs/architecture.md for the full design. One Lambda handles both the
-  SNS-triggered review pipeline and the CloudWatch custom-widget render.
+  Anomaly Detection -> LLM Root-Cause Agent (CloudWatch-native).
+  Subscribes a Lambda to an existing CloudWatch alarm's SNS topic
+  (AlarmTopicArn) — this stack does not create its own alarm/anomaly
+  detector/topic, since one already exists in this account. On alarm, the
+  Lambda gathers real alarm/metric/log evidence plus codebase context
+  (fetched live from GitHub) into one prompt and sends it to Claude. See
+  docs/architecture.md for background — note the notify/dashboard-widget
+  step it describes has since been removed for simplicity; the verdict is
+  logged and returned as the Lambda's invocation result.
 
 Parameters:
-  GithubOwner:
-    Type: String
-    Description: GitHub org/user that owns the demo repo (lambda/git_context.py).
-  GithubRepo:
-    Type: String
-    Description: Demo repo name — the same repo this template lives in.
-  GithubToken:
+  AnthropicApiKey:
     Type: String
     NoEcho: true
     Description: >
-      GitHub PAT with repo read access. Pass via
-      `sam deploy --parameter-overrides GithubToken=$GITHUB_TOKEN` (sourced
-      from .env) — never commit a real value into samconfig.toml.
-  BedrockModelId:
+      Anthropic API key for the direct Claude API call (agent/llm_agent.py).
+      Pass via `sam deploy --parameter-overrides AnthropicApiKey=$ANTHROPIC_API_KEY`
+      (sourced from .env) — never commit a real value into samconfig.toml.
+  LogGroupName:
     Type: String
-    Default: anthropic.claude-3-5-sonnet-20241022-v2:0
+    Default: ""
     Description: >
-      PLACEHOLDER — confirm against the model your Bedrock access request
-      actually grants (docs/architecture.md section 9, bottleneck #1) before
-      first real deploy.
-  NotifyEmail:
+      CloudWatch log group the demo app writes to — queried for log evidence
+      around the alarm window (agent/context_builder.py). Empty = skip log
+      evidence entirely (app doesn't ship logs yet); the hypothesis is based
+      on alarm + metric evidence only until this is set.
+  GithubOwner:
     Type: String
-    Description: Email address subscribed to the human-facing verdict notifications.
+    Default: ""
+    Description: >
+      GitHub org/user codebase context would be fetched from. Currently
+      unused — get_codebase_context_from_github() is stubbed (agent/github_context.py).
+  GithubRepo:
+    Type: String
+    Default: ""
+    Description: Repo name codebase context would be fetched from. Currently unused (stubbed).
+  GithubRef:
+    Type: String
+    Default: ""
+    Description: Branch/commit/tag to fetch codebase_context.md from. Empty = repo's default branch.
+  GithubToken:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: >
+      Optional GitHub token for the codebase-context fetch — raises the API
+      rate limit and is required if the repo is private. Empty = unauthenticated.
   LatencyAnomalySensitivity:
     Type: Number
     Default: 2
-    Description: Standard deviations for the ANOMALY_DETECTION_BAND width.
+    Description: Standard deviations for the ANOMALY_DETECTION_BAND width (dashboard visualization only).
+  AlarmTopicArn:
+    Type: String
+    Description: >
+      ARN of the existing SNS topic to subscribe the Lambda to (e.g. the
+      culprit-alerts topic behind culprit-App-Anomaly) — this stack does not
+      create its own alarm/topic, it hooks into one that already exists.
 
 Globals:
   Function:
-    Runtime: python3.12
+    Runtime: python3.11
     Timeout: 60
     MemorySize: 256
 
 Resources:
-  # ── SNS topics ──────────────────────────────────────────────────────────
-  # Two separate topics, deliberately: the alarm topic drives the Lambda,
-  # the notify topic is the human-facing email. Sharing one topic would make
-  # the Lambda's own notification re-invoke itself.
-  AnomalyAlarmTopic:
-    Type: AWS::SNS::Topic
-    Properties:
-      TopicName: !Sub "${AWS::StackName}-anomaly-alarm"
-
-  AnomalyNotifyTopic:
-    Type: AWS::SNS::Topic
-    Properties:
-      TopicName: !Sub "${AWS::StackName}-anomaly-notify"
-      Subscription:
-        - Protocol: email
-          Endpoint: !Ref NotifyEmail
-
   # ── Lambda ──────────────────────────────────────────────────────────────
   ReviewFunction:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: !Sub "${AWS::StackName}-review"
-      CodeUri: lambda/
+      CodeUri: agent/
       Handler: handler.lambda_handler
       Environment:
         Variables:
+          ANTHROPIC_API_KEY: !Ref AnthropicApiKey
+          LOG_GROUP: !Ref LogGroupName
           GITHUB_OWNER: !Ref GithubOwner
           GITHUB_REPO: !Ref GithubRepo
+          GITHUB_REF: !Ref GithubRef
           GITHUB_TOKEN: !Ref GithubToken
-          BEDROCK_MODEL_ID: !Ref BedrockModelId
-          NOTIFY_TOPIC_ARN: !Ref AnomalyNotifyTopic
       Policies:
         - Statement:
-            - Sid: InvokeBedrock
+            - Sid: ReadAlarmAndMetricEvidence
               Effect: Allow
-              Action: bedrock:InvokeModel
+              Action:
+                - cloudwatch:DescribeAlarms
+                - cloudwatch:GetMetricStatistics
               Resource: "*"
-            - Sid: PublishNotifications
+            - Sid: ReadLogEvidence
               Effect: Allow
-              Action: sns:Publish
-              Resource: !Ref AnomalyNotifyTopic
-            - Sid: PersistLastVerdict
-              # Self-referencing: lets notify.py stash the latest verdict as
-              # this function's own env var instead of standing up
-              # DynamoDB/S3 for a single value (docs/architecture.md §7).
-              Effect: Allow
-              Action: lambda:UpdateFunctionConfiguration
-              Resource: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-review"
+              Action:
+                - logs:StartQuery
+                - logs:GetQueryResults
+                - logs:StopQuery
+              Resource: "*"
       Events:
         AlarmNotification:
           Type: SNS
           Properties:
-            Topic: !Ref AnomalyAlarmTopic
-
-  # CloudWatch dashboards invoke custom widgets directly (not via the SNS
-  # event above), so they need their own explicit invoke permission.
-  DashboardWidgetInvokePermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !Ref ReviewFunction
-      Action: lambda:InvokeFunction
-      Principal: cloudwatch.amazonaws.com
-
-  # ── Anomaly detection ───────────────────────────────────────────────────
-  RequestLatencyAnomalyDetector:
-    Type: AWS::CloudWatch::AnomalyDetector
-    Properties:
-      Namespace: HackathonDemo
-      MetricName: RequestLatency
-      Stat: Average
-
-  RequestLatencyAnomalyAlarm:
-    Type: AWS::CloudWatch::Alarm
-    DependsOn: RequestLatencyAnomalyDetector
-    Properties:
-      AlarmName: !Sub "${AWS::StackName}-RequestLatency-Anomaly"
-      AlarmDescription: >
-        Fires when RequestLatency (namespace HackathonDemo) moves outside its
-        CloudWatch-modeled expected band. See docs/architecture.md §4.
-      ComparisonOperator: GreaterThanUpperThreshold
-      EvaluationPeriods: 2
-      ThresholdMetricId: ad1
-      TreatMissingData: notBreaching
-      Metrics:
-        - Id: m1
-          ReturnData: true
-          MetricStat:
-            Metric:
-              Namespace: HackathonDemo
-              MetricName: RequestLatency
-            Period: 60
-            Stat: Average
-        - Id: ad1
-          ReturnData: true
-          Expression: !Sub "ANOMALY_DETECTION_BAND(m1, ${LatencyAnomalySensitivity})"
-          Label: "RequestLatency (expected band)"
-      AlarmActions:
-        - !Ref AnomalyAlarmTopic
-      OKActions:
-        - !Ref AnomalyAlarmTopic
+            Topic: !Ref AlarmTopicArn
 
   # ── Dashboard ───────────────────────────────────────────────────────────
+  # Plain metric visualization only — no Lambda-backed custom widget, so
+  # this has no dependency on the review pipeline itself.
   AnomalyDashboard:
     Type: AWS::CloudWatch::Dashboard
     Properties:
@@ -174,19 +136,6 @@ Resources:
                   [ "HackathonDemo", "disk_used_percent" ]
                 ]
               }
-            },
-            {
-              "type": "custom",
-              "x": 0, "y": 6, "width": 24, "height": 6,
-              "properties": {
-                "endpoint": "${ReviewFunction.Arn}",
-                "title": "Latest LLM verdict",
-                "updateOn": {
-                  "refresh": true,
-                  "resize": false,
-                  "timeRange": false
-                }
-              }
             }
           ]
         }
@@ -194,9 +143,5 @@ Resources:
 Outputs:
   ReviewFunctionArn:
     Value: !GetAtt ReviewFunction.Arn
-  AnomalyAlarmTopicArn:
-    Value: !Ref AnomalyAlarmTopic
-  AnomalyNotifyTopicArn:
-    Value: !Ref AnomalyNotifyTopic
   DashboardUrl:
     Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AnomalyDashboard}"

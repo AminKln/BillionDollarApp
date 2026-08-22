@@ -1,2 +1,0 @@
-# boto3 ships with the Lambda Python runtime already — nothing to add here
-# unless a future stretch (Tier 2/3) needs an extra package.

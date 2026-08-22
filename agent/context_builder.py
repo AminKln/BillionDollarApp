@@ -31,7 +31,7 @@ class AlarmDetails:
     metric_name: str
     dimensions: dict[str, str]
     comparison_operator: str
-    threshold: float
+    threshold: Optional[float]  # None for metric-math/anomaly-band alarms -- no fixed threshold, the band is dynamic
     period_seconds: int
 
 
@@ -61,7 +61,7 @@ class LogEvidence:
 class IncidentContext:
     alarm: AlarmDetails
     metric: MetricAnomaly
-    logs: LogEvidence
+    logs: Optional[LogEvidence]  # None when no log group is configured (app doesn't ship logs yet)
     generated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def to_llm_context(self) -> str:
@@ -70,9 +70,10 @@ class IncidentContext:
         lines.append(f"ALARM: {self.alarm.name}")
         lines.append(f"  Reason: {self.alarm.state_reason}")
         lines.append(f"  Triggered: {self.alarm.state_updated.isoformat()}")
+        threshold_desc = self.alarm.threshold if self.alarm.threshold is not None else "dynamic (anomaly-detection band, no fixed value)"
         lines.append(
             f"  Metric: {self.alarm.namespace}/{self.alarm.metric_name} "
-            f"{self.alarm.comparison_operator} {self.alarm.threshold}"
+            f"{self.alarm.comparison_operator} {threshold_desc}"
         )
         if self.alarm.dimensions:
             dims = ", ".join(f"{k}={v}" for k, v in self.alarm.dimensions.items())
@@ -87,15 +88,18 @@ class IncidentContext:
         )
 
         lines.append("")
-        lines.append(f"LOG EVIDENCE ({self.logs.log_group}):")
-        lines.append("  Error rate by minute:")
-        for row in self.logs.error_rate_by_bin:
-            lines.append(f"    {row['bin']}: {row['count']}")
-        lines.append(f"  Top {len(self.logs.error_events)} error samples:")
-        for ev in self.logs.error_events:
-            ts = ev.get("@timestamp", "?")
-            msg = ev.get("@message", "").strip().replace("\n", " ")[:300]
-            lines.append(f"    [{ts}] {msg}")
+        if self.logs is None:
+            lines.append("LOG EVIDENCE: not available (no log group configured yet — base the hypothesis on the alarm and metric evidence only).")
+        else:
+            lines.append(f"LOG EVIDENCE ({self.logs.log_group}):")
+            lines.append("  Error rate by minute:")
+            for row in self.logs.error_rate_by_bin:
+                lines.append(f"    {row['bin']}: {row['count']}")
+            lines.append(f"  Top {len(self.logs.error_events)} error samples:")
+            for ev in self.logs.error_events:
+                ts = ev.get("@timestamp", "?")
+                msg = ev.get("@message", "").strip().replace("\n", " ")[:300]
+                lines.append(f"    [{ts}] {msg}")
 
         return "\n".join(lines)
 
@@ -109,17 +113,42 @@ def get_alarm_details(alarm_name: str, region: str = "us-east-1", client=None) -
     if not alarms:
         raise ValueError(f"No alarm found named {alarm_name!r}")
     a = alarms[0]
+
+    if "Namespace" in a:
+        # Simple, single-metric alarm -- Namespace/MetricName/Dimensions/
+        # Period/Threshold all live at the top level.
+        namespace = a["Namespace"]
+        metric_name = a["MetricName"]
+        dimensions = {d["Name"]: d["Value"] for d in a.get("Dimensions", [])}
+        period_seconds = a["Period"]
+        threshold = a.get("Threshold")
+    else:
+        # Metric-math alarm (e.g. ANOMALY_DETECTION_BAND) -- there's no
+        # single top-level metric; it's one of several entries in Metrics[].
+        # Find the one with a MetricStat (the underlying metric query, not
+        # the anomaly-band expression) and pull namespace/metric/dims/period
+        # from there. No fixed Threshold exists -- the band is dynamic.
+        metric_query = next((m for m in a.get("Metrics", []) if "MetricStat" in m), None)
+        if metric_query is None:
+            raise ValueError(f"Alarm {alarm_name!r} has no MetricStat in its Metrics -- can't determine its metric")
+        metric = metric_query["MetricStat"]["Metric"]
+        namespace = metric["Namespace"]
+        metric_name = metric["MetricName"]
+        dimensions = {d["Name"]: d["Value"] for d in metric.get("Dimensions", [])}
+        period_seconds = metric_query["MetricStat"]["Period"]
+        threshold = None
+
     return AlarmDetails(
         name=a["AlarmName"],
         description=a.get("AlarmDescription"),
         state_reason=a.get("StateReason", ""),
         state_updated=a["StateUpdatedTimestamp"],
-        namespace=a["Namespace"],
-        metric_name=a["MetricName"],
-        dimensions={d["Name"]: d["Value"] for d in a.get("Dimensions", [])},
+        namespace=namespace,
+        metric_name=metric_name,
+        dimensions=dimensions,
         comparison_operator=a["ComparisonOperator"],
-        threshold=a["Threshold"],
-        period_seconds=a["Period"],
+        threshold=threshold,
+        period_seconds=period_seconds,
     )
 
 
@@ -254,9 +283,12 @@ def get_log_evidence(
 
 # ---------- orchestration ----------
 
-def build_incident_context(alarm_name: str, log_group: str, region: str = "us-east-1") -> IncidentContext:
+def build_incident_context(alarm_name: str, log_group: Optional[str], region: str = "us-east-1") -> IncidentContext:
     """
-    Assembles CloudWatch alarm + metric + log evidence into one IncidentContext.
+    Assembles CloudWatch alarm + metric + (optionally) log evidence into one
+    IncidentContext. Pass log_group=None (or "") to skip the log evidence
+    step entirely -- for when the app doesn't ship logs yet. Re-enables
+    itself automatically the moment a real log group is configured.
 
     PR/diff correlation is deliberately not wired in here yet. When it comes
     back, it should query the same window (metric.window_start / window_end)
@@ -266,7 +298,11 @@ def build_incident_context(alarm_name: str, log_group: str, region: str = "us-ea
     """
     alarm = get_alarm_details(alarm_name, region=region)
     metric = get_metric_anomaly(alarm, region=region)
-    logs = get_log_evidence(log_group, metric.window_start, metric.window_end, region=region)
+    logs = (
+        get_log_evidence(log_group, metric.window_start, metric.window_end, region=region)
+        if log_group
+        else None
+    )
     return IncidentContext(alarm=alarm, metric=metric, logs=logs)
 
 

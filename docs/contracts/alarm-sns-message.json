@@ -1,6 +1,6 @@
 {
   "_contract": "alarm-sns-message",
-  "_description": "Shape of the JSON string inside event.Records[0].Sns.Message when the review Lambda is invoked via its SNS subscription to a CloudWatch alarm's AlarmActions. Only NewStateValue == 'ALARM' should trigger the pipeline; 'OK' transitions arrive too and should be ignored (see lambda/handler.py).",
+  "_description": "Shape of the JSON string inside event.Records[0].Sns.Message when the review Lambda is invoked via its SNS subscription to a CloudWatch alarm's AlarmActions. Only NewStateValue == 'ALARM' should trigger the pipeline; 'OK' transitions arrive too and should be ignored (see agent/handler.py).",
   "AlarmName": "HackathonDemo-RequestLatency-Anomaly",
   "AlarmDescription": "Anomaly detection alarm on HackathonDemo/RequestLatency",
   "AWSAccountId": "123456789012",

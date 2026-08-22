@@ -121,11 +121,3 @@ def diagnose_incident(
         supporting_evidence=data["supporting_evidence"],
         suggested_action=data["suggested_action"],
     )
-
-
-if __name__ == "__main__":
-    from demo_local import run_scenario
-
-    ctx = run_scenario("db_timeout")
-    result = diagnose_incident(ctx)
-    print(result.to_text())

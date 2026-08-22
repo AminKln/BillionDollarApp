@@ -1,0 +1,2 @@
+# boto3 ships with the Lambda Python runtime already.
+anthropic
