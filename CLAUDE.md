@@ -55,6 +55,15 @@ the original (now superseded) Bedrock/`lambda/`-based plan.**
   mode adaptive thinking can cause on `claude-sonnet-5` at a low cap (see
   `pipeline/`'s note below); that failure mode was only observed on
   free-text (no forced tool) calls.
+- `agent/github_issue.py` — `open_or_update_issue(owner, repo, alarm_name,
+  verdict)`: the verdict's actual human-visible destination (see
+  `docs/current-pipeline.md` §5b) — opens a GitHub issue on the target
+  repo with the verdict as Markdown, or comments on an already-open one for
+  the same alarm (title-prefix matched, not a label — a token with only
+  issue-write access 403s on label-create for a new label, confirmed
+  against the real repo). **Requires `GITHUB_TOKEN` with write access** —
+  the only step in this pipeline where that's true. Non-fatal on failure;
+  `handler.py` catches and logs, the verdict itself is unaffected.
 - `agent/run_manual.py` + `agent/fake_alert.py` + `agent/fixtures.py` — CLI
   entry point against a **fake** alert (canned CloudWatch data via
   `botocore.stub.Stubber`, two scenarios), still calls the real
@@ -132,12 +141,17 @@ CloudWatch side, but still makes a real GitHub + Claude call):
 
 **Deploy/redeploy the SAM-based `agent/` pipeline:**
 ```bash
-cp .env.example .env   # fill in ANTHROPIC_API_KEY, ALARM_TOPIC_ARN, GITHUB_OWNER=Tehreem404, GITHUB_REPO=bad_app_demo
-./scripts/deploy.sh    # wraps: sam build && sam deploy --parameter-overrides ...
+cp .env.example .env   # fill in ANTHROPIC_API_KEY, ALARM_TOPIC_ARN, GITHUB_OWNER=Tehreem404, GITHUB_REPO=bad_app_demo, GITHUB_TOKEN (write access, needed for github_issue.py)
+./scripts/deploy.sh    # wraps: sam build && sam deploy --parameter-overrides ... (confirms an interactive changeset -- see below)
 ```
-As of this branch's merge, this has **not yet been redeployed** — the live
-`anomaly-review-agent-review` function still runs the old placeholder
-codebase-context stub until this is run again.
+`sam deploy` (via `samconfig.toml`'s `confirm_changeset = true`) prompts
+`Deploy this changeset? [y/N]` interactively — pipe `y` in for a
+non-interactive run, e.g. `yes y | ./scripts/deploy.sh`. Live as of this
+branch: the real codebase-context fetch (`github_context.py`) is deployed
+and confirmed working against `anomaly-review-agent-review` directly. The
+GitHub issue step (`github_issue.py`) is **not yet deployed** — verified
+locally/against the real GitHub API, but needs another `./scripts/deploy.sh`
+run to reach the live function.
 
 ## Key architectural facts worth knowing before editing
 

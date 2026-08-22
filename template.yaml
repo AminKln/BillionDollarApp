@@ -6,10 +6,12 @@ Description: >
   (AlarmTopicArn) — this stack does not create its own alarm/anomaly
   detector/topic, since one already exists in this account. On alarm, the
   Lambda gathers real alarm/metric/log evidence plus codebase context
-  (fetched live from GitHub) into one prompt and sends it to Claude. See
-  docs/architecture.md for background — note the notify/dashboard-widget
-  step it describes has since been removed for simplicity; the verdict is
-  logged and returned as the Lambda's invocation result.
+  (fetched live from GitHub) into one prompt, sends it to Claude, and opens
+  (or comments on an existing open) GitHub issue on the target app's repo
+  with the verdict. See docs/architecture.md for background — note the
+  original SNS-email/dashboard-widget notify step it describes was replaced
+  by the GitHub issue step; the verdict is also logged and returned as the
+  Lambda's invocation result.
 
 Parameters:
   AnthropicApiKey:
@@ -47,8 +49,13 @@ Parameters:
     NoEcho: true
     Default: ""
     Description: >
-      Optional GitHub token for the codebase-context fetch — raises the API
-      rate limit and is required if the repo is private. Empty = unauthenticated.
+      GitHub token, needed for two things: (1) the codebase-context fetch
+      (agent/github_context.py) — optional for a public repo, raises the
+      rate limit; required for a private one; (2) the GitHub issue step
+      (agent/github_issue.py) — REQUIRED with write access to the target
+      repo regardless of visibility; issue creation/comments are never
+      possible unauthenticated. Empty = codebase fetch still works
+      (rate-limited), but the issue step fails (non-fatally, just logged).
   LatencyAnomalySensitivity:
     Type: Number
     Default: 2

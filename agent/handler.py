@@ -3,9 +3,11 @@ handler.py
 
 SNS-triggered entry point: a real CloudWatch alarm fires -> real evidence
 (context_builder) + real codebase context (github_context) -> one prompt ->
-Claude. No notification/dashboard step -- the verdict is logged and
-returned as the invocation result. For the fake-alert equivalent, see
-run_manual.py.
+Claude -> a GitHub issue on the target repo with the verdict (github_issue).
+The verdict is also logged and returned as the invocation result, but the
+GitHub issue is the actual human-visible surface -- see
+docs/current-pipeline.md for why that used to be the only sink. For the
+fake-alert equivalent, see run_manual.py.
 """
 
 import json
@@ -14,6 +16,7 @@ import os
 
 from context_builder import build_incident_context
 from github_context import get_codebase_context_from_github
+from github_issue import open_or_update_issue
 from llm_agent import diagnose_incident
 
 logger = logging.getLogger()
@@ -61,4 +64,19 @@ def _handle_alarm(alarm):
     }
 
     logger.info("Verdict for %s: %s", alarm_name, json.dumps(verdict))
+
+    try:
+        issue = open_or_update_issue(
+            owner=os.environ.get("GITHUB_OWNER", ""),
+            repo=os.environ.get("GITHUB_REPO", ""),
+            alarm_name=alarm_name,
+            verdict=verdict,
+        )
+        logger.info("GitHub issue %s for %s: %s", issue["action"], alarm_name, issue["html_url"])
+        verdict["github_issue_url"] = issue["html_url"]
+    except (RuntimeError, ValueError) as exc:
+        # Non-fatal: the diagnosis itself is still valid and logged above --
+        # a broken/missing GITHUB_TOKEN shouldn't erase the work already done.
+        logger.error("Could not open/update GitHub issue for %s: %s", alarm_name, exc)
+
     return verdict

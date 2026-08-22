@@ -16,16 +16,22 @@ SNS topic. A Lambda subscribed to that topic gathers real alarm/metric/log
 evidence via `boto3`, fetches the target app's **entire current codebase**
 live from GitHub, combines both into one prompt, and sends it to Claude via
 the direct Anthropic API for a grounded root-cause hypothesis. The verdict
-is logged and returned as the Lambda's invocation result — there is no
-notification or dashboard-widget step; both existed in the original design
-and were deliberately removed for a simpler MVP.
+is then surfaced as a **real GitHub issue** on the target app's repo (opened
+fresh, or commented on an existing open one for the same alarm to avoid
+spam on a flapping alarm — see §5b) — this replaced the original
+SNS-email/dashboard-widget notify step, which was removed for a simpler
+MVP and never rebuilt. The verdict is also logged and returned as the
+Lambda's invocation result, but until the GitHub issue step existed, that
+log line was the *only* place the diagnosis ever went — nothing was
+watching it.
 
 Deployed and **verified against real AWS data** (not just fixtures) as of
 this writing: stack `anomaly-review-agent`, region `us-east-1`, subscribed
 to the real `culprit-alerts` SNS topic behind the real `culprit-App-Anomaly`
-alarm. The codebase-context fetch is verified against the real target repo
-([`Tehreem404/bad_app_demo`](https://github.com/Tehreem404/bad_app_demo)) —
-see §5.
+alarm. The codebase-context fetch and the GitHub issue step are both
+verified against the real target repo
+([`Tehreem404/bad_app_demo`](https://github.com/Tehreem404/bad_app_demo))
+— see §5 and §5b.
 
 ## 1. Request flow
 
@@ -53,18 +59,26 @@ _handle_alarm(alarm)
     │       repo's entire current source tree, in full up to a 40k-char
     │       budget, ranked by relevance to the alarm's metric (see §5)
     │
-    └─▶ llm_agent.diagnose_incident(ctx, codebase_context)
-            ├─ ctx.to_llm_context() renders the alarm/metric/log digest
-            ├─ prepended with "CODEBASE CONTEXT:\n{codebase_context}\n...\n"
-            │  if codebase_context is non-empty
-            ├─ one Anthropic API call, model claude-sonnet-5, forced tool
-            │  use (report_root_cause), system prompt instructs the model
-            │  to ground strictly in the provided evidence
-            └─ returns hypothesis / confidence / supporting_evidence /
-               suggested_action
+    ├─▶ llm_agent.diagnose_incident(ctx, codebase_context)
+    │       ├─ ctx.to_llm_context() renders the alarm/metric/log digest
+    │       ├─ prepended with "CODEBASE CONTEXT:\n{codebase_context}\n...\n"
+    │       │  if codebase_context is non-empty
+    │       ├─ one Anthropic API call, model claude-sonnet-5, forced tool
+    │       │  use (report_root_cause), system prompt instructs the model
+    │       │  to ground strictly in the provided evidence
+    │       └─ returns hypothesis / confidence / supporting_evidence /
+    │          suggested_action
+    │
+    └─▶ github_issue.open_or_update_issue(owner, repo, alarm_name, verdict)
+            ├─ searches open issues for one already opened for this alarm
+            │  (title-prefix match, not a label -- see §5b)
+            ├─ found -> POST a comment with the new verdict onto it
+            └─ not found -> POST a new issue with the verdict as the body
+               (non-fatal on failure -- logged, doesn't erase the verdict
+               already logged/returned above)
 
 logger.info("Verdict for %s: %s", alarm_name, json.dumps(verdict))
-return verdict   # no email, no dashboard update, no persistence
+return verdict   # verdict also carries github_issue_url on success
 ```
 
 `agent/run_manual.py` runs the identical `context_builder`-to-`llm_agent`
@@ -86,6 +100,7 @@ build/staging step, what's in this folder is exactly what gets deployed.
 | `fake_alert.py` | `build_fake_incident(scenario_name)` — runs the *real* collector functions in `context_builder.py` against the stubbed clients from `fixtures.py`. Used only by `run_manual.py`. |
 | `github_context.py` | `get_codebase_context_from_github(owner, repo, ref, metric_name)` — real implementation (see §5): fetches the target repo's entire current source tree via the GitHub REST API (`git/trees` + `git/blobs`, no `git` binary needed — Lambda doesn't have one), ranked by relevance to `metric_name` when the codebase exceeds the char budget. |
 | `llm_agent.py` | `diagnose_incident(context, codebase_context="", client=None)` — builds the prompt, calls Claude, parses the structured response. This is the single point where all context sources get combined into one prompt (§4 explains exactly where). |
+| `github_issue.py` | `open_or_update_issue(owner, repo, alarm_name, verdict)` — real implementation (see §5b): opens a GitHub issue on the target repo with the verdict, or comments on an already-open one for the same alarm. **Requires `GITHUB_TOKEN` with write access** — the only step in this pipeline that does. |
 | `codebase_context.md` | Hand-maintained placeholder from the original stub design (fetch-one-file-from-this-repo). No longer read by `github_context.py`, which now fetches the *target app's* entire repo instead of one hand-maintained summary file. Left in place, unused — flagged rather than deleted since another branch may still reference it. |
 | `requirements.txt` | Just `anthropic` — `boto3` ships with the Lambda runtime. |
 
@@ -157,6 +172,46 @@ fabricating data. Re-enables itself automatically the moment `LOG_GROUP` is
 set to a real log group — no code change needed, just a `template.yaml`
 parameter. (No log group exists for the target app as of this writing.)
 
+## 5b. GitHub issue: where the verdict actually surfaces
+
+Before `agent/github_issue.py` existed, the verdict's only destination was
+`logger.info()` — nothing consumed the Lambda's return value on a real
+SNS-triggered invocation (SNS-async invocations discard it), and neither
+`AnomalyDashboard` in `template.yaml` nor anything else read the logs. A
+real anomaly could fire, get correctly diagnosed, and nobody would ever see
+it without manually opening CloudWatch Logs.
+
+`open_or_update_issue(owner, repo, alarm_name, verdict)`:
+
+1. Lists the repo's open issues and looks for one whose title already
+   starts with `"Anomaly diagnosis: {alarm_name} ("` — **not** a label.
+   Confirmed against the real repo: a token with issue-write access but no
+   broader repo/triage permission gets a `403` trying to apply a label that
+   doesn't already exist in the repo (`"You do not have permission to
+   create labels on this repository"`), so this deliberately avoids the
+   labels API entirely and relies on the title prefix instead.
+2. If found: `POST /issues/{number}/comments` with the new verdict —
+   avoids opening a duplicate issue every time a flapping alarm re-fires
+   (`culprit-App-Anomaly` was observed flipping `ALARM<->OK` repeatedly
+   within minutes during this branch's own testing).
+3. If not found: `POST /issues` with the verdict as the body.
+
+Issue body is the verdict's `hypothesis`/`confidence`/`supporting_evidence`/
+`suggested_action` rendered as Markdown, ending with a note that it was
+opened automatically (not a human-filed issue).
+
+**Requires `GITHUB_TOKEN` with write access to the target repo** — this is
+new: `github_context.py`'s codebase fetch works fine unauthenticated for a
+public repo, but issue creation/comments never do, regardless of
+visibility. If `GITHUB_TOKEN` is unset or lacks permission,
+`open_or_update_issue()` raises `RuntimeError`/`ValueError`, and
+`handler.py` catches that non-fatally — logs the error, the verdict itself
+(already logged/returned above) is unaffected.
+
+Verified against the real target repo: created a real issue, verified a
+second run for the same alarm commented on it instead of duplicating, then
+closed the test issue as cleanup (`state_reason: not_planned`).
+
 ## 6. Why full codebase instead of diff correlation
 
 The **original** design (`architecture.md` §5, and this doc's previous
@@ -185,7 +240,7 @@ branch is waiting on.
 |---|---|---|
 | Amazon Bedrock `InvokeModel` | Direct Anthropic API (`agent/llm_agent.py`) | Bedrock model access request was an external blocking dependency with no guaranteed turnaround; direct API was already proven working and unblocked an MVP faster. |
 | `lambda/git_context.py` — diff correlation | **Not built** (superseded by full-codebase context, §6) | Simplification decision, then superseded rather than revisited — see §6 for why full-codebase won over diff. |
-| `lambda/notify.py` — SNS email + CloudWatch custom widget | **Removed** | Scoped down to "just react and log the verdict" — email/dashboard-widget were judged unnecessary complexity for the core loop. |
+| `lambda/notify.py` — SNS email + CloudWatch custom widget | **Removed, then replaced by a GitHub issue** (`agent/github_issue.py`, §5b) | Initially scoped down to "just react and log the verdict" for MVP simplicity; later given a real human-visible sink once it became clear nothing was reading the logs. |
 | `lambda/`, `LLM/`, `cloudWatch/` — three folders, hand-copied duplicates staged into `lambda/` at build time | Single `agent/` folder — Lambda's `CodeUri` *is* the source, no staging | Eliminates drift risk between "what you edit" and "what deploys" entirely, by construction. |
 | This repo creates its own `AWS::CloudWatch::AnomalyDetector` + `Alarm` + SNS topic | Subscribes to an **existing**, externally-managed alarm (`culprit-App-Anomaly`) and topic (`culprit-alerts`) via a `AlarmTopicArn` parameter | The real app/alarm turned out to already exist (built in a separate repo), so this stack no longer owns alarm creation — just reaction. |
 | `infra/demo-app/`, `infra/cloudwatch-agent/`, `scripts/trigger_chaos.sh`, `scripts/seed_bad_commit.sh` | **Removed** | Not connected to the actual running app (which lives in a different repo) — dead scaffolding. |
@@ -217,6 +272,14 @@ branch is waiting on.
   output) — that failure mode was previously confirmed on the free-text
   path in `pipeline/diagnose.py`; the forced-tool-use path here returned a
   valid verdict without needing a higher cap.
+- ✅ **(This branch)** GitHub issue step tested against the real target repo
+  (`Tehreem404/bad_app_demo`) — created a real issue with the verdict
+  rendered as Markdown, a second call for the same alarm correctly
+  commented on the existing open issue instead of duplicating it, then the
+  test issue was closed as cleanup. Also caught a real permission gap:
+  labeling requires broader repo access than issue-write alone (a `403` on
+  label-create) — worked around by using a title-prefix match instead of a
+  label for the dedup lookup (§5b), not by requesting more token scope.
 - ✅ Deployed stack (`anomaly-review-agent`) confirmed `CREATE_COMPLETE`,
   subscribed to the real `culprit-alerts` topic.
 - ❓ **Never observed a genuine SNS-triggered invocation** — only direct
@@ -225,11 +288,15 @@ branch is waiting on.
   plumbing (auto-confirmed for Lambda-protocol subscriptions, no custom
   logic involved), so this is low-risk, but it has not been observed firing
   for real as of this writing.
-- ❓ **This branch's `agent/github_context.py` changes are not yet deployed**
-  — the live `anomaly-review-agent-review` function still runs the
-  placeholder-string version until `sam deploy` is run again from this
-  branch (see `scripts/deploy.sh`; needs `GithubOwner=Tehreem404`,
-  `GithubRepo=bad_app_demo` set as parameters, since they default to empty).
+- ✅ **(This branch)** `agent/github_context.py`'s real implementation is
+  deployed and confirmed live: invoked `anomaly-review-agent-review`
+  directly post-deploy, its own `GITHUB_OWNER`/`GITHUB_REPO` env vars read
+  back as `Tehreem404`/`bad_app_demo`, and the returned verdict cited
+  `codebase:app.py` real content, not the placeholder string.
+- ❓ **This branch's `agent/github_issue.py` addition is not yet deployed**
+  — verified locally/against the real GitHub API (§5b, §8 above) but the
+  live `anomaly-review-agent-review` function doesn't have this code yet
+  until `sam deploy` is run again from this branch.
 - ❌ Log evidence path (`get_log_evidence()`) has never been exercised
   against a real log group — only against fixtures. Stubbed off in the live
   deploy (§5) specifically because this was never wired up on the real
