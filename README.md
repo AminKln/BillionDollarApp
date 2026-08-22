@@ -20,10 +20,18 @@ the point.
 
 ## Read this first
 
-**[`docs/architecture.md`](docs/architecture.md) is the single source of
-truth** — the design, the component specs, the interfaces between
-workstreams, the hour-by-hour build order, and the demo runbook. Everything
-else in this repo is subordinate to it.
+**Demo day, in order:**
+
+1. **[`docs/decisions.md`](docs/decisions.md)** — 4 minutes. Three people built
+   overlapping pipelines; this picks one of each and says why. It also
+   documents the bug that made the demo impossible to trigger (§1) and the two
+   things W3 and W4 must change (§6). Read it before you touch anything.
+2. **[`docs/runbook.md`](docs/runbook.md)** — the demo itself, minute by
+   minute, with measured timings from a real run.
+3. **[`docs/architecture.md`](docs/architecture.md)** — the design, the
+   component specs, and the interfaces between workstreams. Still the source
+   of truth for *how it works*; `decisions.md` overrides it wherever the two
+   disagree about *what we are doing tonight*.
 
 ---
 
@@ -35,7 +43,7 @@ path they do not own.
 | | Workstream | Owns | Starts |
 |---|---|---|---|
 | **W1** | The app & the box | `app/`, EC2, systemd units | immediately |
-| **W2** | Detection & dispatch | `template.yaml`, `scripts/calibrate.sh`, `scripts/deploy.sh` | immediately (deploys after W1) |
+| **W2** | Detection & dispatch | `infra/detection.yaml`, `scripts/calibrate.sh`, `scripts/deploy_detection.sh` | **done — deployed and watching W1's box** |
 | **W3** | The agent | `.github/`, `scripts/gather_evidence.sh`, `scripts/test_dispatch.sh` | **first — zero AWS dependencies** |
 | **W4** | The incident & the demo | `scripts/seed_incident.sh`, runbook, rehearsals | after W1 |
 
@@ -93,20 +101,48 @@ scripts/                deploy.sh · seed_bad_commit.sh · trigger_chaos.sh
 fail at runtime, four worth fixing before the demo — with the file and line
 for each. It does not change them; the owner of each path decides.
 
-**Being added** — one owner per path, nobody edits a path they do not own:
+**Ownership** — one owner per path, nobody edits a path they do not own:
 
 ```
-app/                    W1  Flask service, /compute, metric emission, traffic generator.
-                            app/compute.py is where the regression lives.
-scripts/calibrate.sh    W2  derives the alarm threshold from observed traffic
-scripts/gather_evidence.sh  W3  builds INCIDENT.md from CloudWatch + git
-scripts/test_dispatch.sh    W3  GitHub-half smoke test (already here)
-.github/workflows/      W3  anomaly-response.yml — the agent run and the verdict gate
-scripts/seed_incident.sh W4 the four commits, one of which is the culprit
-docs/architecture.md        The plan. Read it.
-docs/contracts/             dispatch-payload.json · verdict.schema.json —
-                            the frozen interfaces between workstreams.
+W2 — detection & dispatch (BUILT, deployed, end-to-end verified)
+  infra/detection.yaml        alarms + anomaly detector + EventBridge + dispatch Lambda
+  scripts/seed_metrics.py     second feed: 10s resolution + a trained band, kept
+                              deliberately alongside the real app (see w2-detection.md)
+  scripts/calibrate.sh        derives the alarm threshold from observed traffic
+  scripts/deploy_detection.sh deploys the stack (separate from template.yaml by design)
+  scripts/verify_chain.sh     8 checks; proves the chain without waiting for a regression
+  .github/workflows/dispatch-receipt.yml  proof the payload arrives (not W3's agent)
+  docs/w2-detection.md        how it works, what is still fake, and what replaces it
+
+Still to come — one owner per path:
+  app/                        W1  the Flask service is LIVE on EC2 and alarmed
+                                  (i-091814f7a41456cb0), but its source is not in
+                                  this repo yet. W4 needs it here to plant a culprit
+                                  commit, and W3 needs it to open a PR against.
+  scripts/gather_evidence.sh  W3  builds INCIDENT.md from CloudWatch + git
+  scripts/test_dispatch.sh    W3  GitHub-half smoke test (already here)
+  .github/workflows/anomaly-response.yml  W3  the agent run and the verdict gate
+  scripts/seed_incident.sh    W4  the four commits, one of which is the culprit
+
+  docs/decisions.md               What we keep, what we drop, who does what.
+  docs/runbook.md                 The demo, minute by minute.
+  docs/architecture.md            The plan. Read it.
+  docs/contracts/                 dispatch-payload.json · verdict.schema.json ·
+                                  eventbridge-alarm-event.json — the frozen
+                                  interfaces between workstreams.
 ```
+
+W2 is deployed and needs nothing from anyone. Six alarms across two feeds —
+W1's real app on EC2 and a synthetic high-resolution feed we control — all
+converge on one EventBridge rule and one Lambda, and `make verify` proves the
+alarm → EventBridge → Lambda → payload chain against real CloudWatch without
+waiting for a regression. Watch it at the `Culprit` dashboard (`make dashboard`).
+
+One thing is still missing, and it is not ours: the Lambda has no
+`GITHUB_TOKEN`, so it logs the payload it would have POSTed instead of sending
+it. W3 mints the PAT; completing the chain is then one redeploy
+(`GITHUB_TOKEN=… make deploy`). See `docs/w2-detection.md` for the full gap
+register.
 
 ## Secrets
 

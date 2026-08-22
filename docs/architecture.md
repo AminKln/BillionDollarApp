@@ -13,6 +13,32 @@
 > or a different order, say so in team chat and update §4 or §6. A plan nobody
 > edits is a plan nobody is following.
 
+> ---
+> ### ⚠️ Read `docs/decisions.md` first — parts of this document are superseded.
+>
+> This is the **design plan**, written before the real EC2 app existed. It is
+> still the right target and most of it is still accurate. But three things in
+> here are no longer what we are doing tonight, and `docs/decisions.md` is the
+> authority where they disagree:
+>
+> 1. **The `WorkUnits` / `RequestCount` pivot** (§1, §7, and the demo script in
+>    §9) is retired. The real app publishes neither, and its traffic generator
+>    is a closed loop, so request count *collapses* during a regression instead
+>    of holding flat. The replacement discriminator — measured, not hoped for —
+>    is `RequestLatency` **and** `cpu_usage_active` rising together while
+>    `ErrorRate`, `mem_used_percent` and `disk_used_percent` stay flat. See
+>    `decisions.md` §3 and the real capture in `contracts/dispatch-payload.json`.
+> 2. **Chaos is not HTTP.** Anywhere this doc implies `curl /chaos/...`, the
+>    real app reads SSM Parameter Store on every request. Use `make app-regress`
+>    / `make app-recover`, which drive `scripts/chaos.sh`. `decisions.md` §1.
+> 3. **The demo script in §9 is aspirational** (git push → auto-deploy →
+>    regression). The rehearsed, timed, actually-working run is
+>    `docs/runbook.md`. Run that one.
+>
+> Everything else — the EventBridge → Lambda → `repository_dispatch` spine, the
+> anomaly-band reasoning, the interface contracts — is current.
+> ---
+
 > **Naming:** the project was briefly called "PromptOps" during design. It is
 > now **Culprit** — the agent's job is to name the guilty commit. The
 > CloudWatch namespace is `Culprit`. If the team prefers another name, change
@@ -124,12 +150,22 @@ Start at `CORPUS_SIZE = 4000` (~8M comparisons after the regression) and
 │  culprit-traffic.service  fixed-rate loop: POST /compute; sleep $SLEEP │
 │  culprit-deploy.timer     every 20s: git fetch; if behind → reset+restart│
 └───────────────────────────────────┬───────────────────────────────────┘
-                                    │  put_metric_data (StorageResolution=1)
+                                    │  put_metric_data + CloudWatch agent
                                     ▼
-┌─ CloudWatch · namespace "Culprit" ────────────────────────────────────┐
-│  RequestLatency ──┬─→ Culprit-Latency-High     static, Period 10  ◀ TRIGGER
-│                   └─→ Culprit-Latency-Anomaly  ML band, Period 60 ◀ DASHBOARD
-│  SystemLoad1                                                      ◀ EVIDENCE
+┌─ CloudWatch · namespace "HackathonDemo" — W1's real app, LIVE ────────┐
+│  RequestLatency ──┬─→ culprit-App-High         static, Period 60  ◀ TRIGGER
+│  (SECONDS,        └─→ culprit-App-Anomaly      ML band, Period 60 ◀ TRIGGER
+│   App=bad-app-ec2)                                                         
+│  ErrorRate ─────────→ culprit-App-ErrorRate    corroboration only ◀ EVIDENCE
+├─ namespace "HackathonDemo/System" (CloudWatch agent on the box) ──────┤
+│  cpu_usage_active · mem_used_percent · disk_used_percent          ◀ DASHBOARD
+└───────────────────────────────────┬───────────────────────────────────┘
+                                    │   both feeds emit onto the SAME bus and
+                                    │   are served by the SAME Lambda ↓
+┌─ CloudWatch · namespace "Culprit" — synthetic feed, 10s, kept on ─────┐
+│  RequestLatency ──┬─→ culprit-Latency-High     static, Period 10  ◀ TRIGGER
+│  (MILLISECONDS)   └─→ culprit-Latency-Anomaly  ML band, Period 60 ◀ TRIGGER
+│  SystemLoad1 ───────→ culprit-Load-High        corroboration only ◀ EVIDENCE
 │  WorkUnits        ← stays flat. this is the discriminator.        ◀ EVIDENCE
 │  RequestCount                                                     ◀ EVIDENCE
 └───────────────────────────────────┬───────────────────────────────────┘
@@ -137,7 +173,10 @@ Start at `CORPUS_SIZE = 4000` (~8M comparisons after the regression) and
                                     │  "CloudWatch Alarm State Change"
                                     ▼
 ┌─ Lambda culprit-dispatch · python3.12 · stdlib only · inline in CFN ──┐
+│  read ns/metric/period from detail.configuration.metrics[].metricStat │
 │  parse detail.state.reasonData (a nested JSON *string*)               │
+│  dedup: an -Anomaly alarm drops itself if its -High twin is in ALARM  │
+│  evidence: one SEARCH over that namespace, before/now per metric      │
 │  POST https://api.github.com/repos/{owner}/{repo}/dispatches  → 204   │
 └───────────────────────────────────┬───────────────────────────────────┘
                                     ▼
@@ -190,11 +229,20 @@ alarm fires.
 
 ---
 
-## 3. Detection: two alarms, two jobs
+## 3. Detection: two feeds, two kinds of alarm
 
-Both are live. Only one is wired to EventBridge.
+Two metric feeds are live: the original synthetic publisher (namespace
+`Culprit`) and, since W1's app landed on EC2, the real app itself (namespace
+`HackathonDemo`). Each feed carries a static alarm and an ML anomaly-band
+alarm — four alarms, and all four dispatch to EventBridge — plus one
+corroboration-only alarm each (`culprit-Load-High` on `Culprit`,
+`culprit-App-ErrorRate` on `HackathonDemo`) that does not. Six alarms total.
+The pair documented in detail below is the `Culprit` feed; `culprit-App-High`
+and `culprit-App-Anomaly` on `HackathonDemo` follow the same static/band
+split against the app's own `RequestLatency` (seconds, not milliseconds —
+see I1) and its `App=bad-app-ec2` dimension.
 
-### `Culprit-Latency-High` — the trigger (static)
+### `culprit-Latency-High` — the trigger (static)
 
 ```yaml
 Namespace: Culprit
@@ -205,13 +253,22 @@ EvaluationPeriods: 2
 DatapointsToAlarm: 2
 Threshold: !Ref LatencyThresholdMs      # from scripts/calibrate.sh — never guessed
 ComparisonOperator: GreaterThanThreshold
-TreatMissingData: notBreaching
+TreatMissingData: ignore   # NOT notBreaching — see below
 ```
 
-Fires ~30–50 s after the bad code goes live. This is the one that starts the
-pipeline.
+Fires ~30–50 s after the bad code goes live (measured: 45 s). This is the one
+that starts the pipeline.
 
-### `Culprit-Latency-Anomaly` — the ML band
+`TreatMissingData: ignore` is load-bearing and was `notBreaching` first. The
+publisher emits every ~10 s into a 10 s period, so period boundaries routinely
+land between samples and that period has no datapoint at all. `notBreaching`
+scores each gap as healthy, drops the alarm to OK mid-incident, and re-fires it
+on the next sample. Measured: one regression produced **three** OK→ALARM
+transitions in 25 s — three EventBridge events, three dispatches, three agent
+runs, three pull requests, for one bug. `ignore` holds state across a gap, so
+one incident is one dispatch. It also refuses to report a dead publisher as OK.
+
+### `culprit-Latency-Anomaly` — the ML band
 
 ```yaml
 ComparisonOperator: GreaterThanUpperThreshold
@@ -229,14 +286,35 @@ Metrics:
     ReturnData: true
 ```
 
-**Not wired to EventBridge**, deliberately. Anomaly alarms are capped at a
-60-second minimum period, so this fires 60–90 s after the static one. Racing
-them would produce two dispatches and two workflow runs.
+**Wired to EventBridge, same as the static alarm.** It was not, originally —
+the first cut reasoned that anomaly alarms are capped at a 60-second minimum
+period, so this fires 60–90 s after the static one, and racing them would
+produce two dispatches and two workflow runs. That reasoning stopped holding
+once you take the project's whole pitch seriously: catching regressions
+nobody specified. A static threshold only ever catches the failure you
+already imagined and hand-tuned a number for; leaving the band undispatched
+meant the demo's headline detector never actually triggered anything.
 
-Instead the band earns its place two other ways:
+What replaced "don't wire it" is deduplication in the Lambda, not a
+threshold argument. Every alarm is named `culprit-<feed>-High` or
+`culprit-<feed>-Anomaly`. On invocation, an `-Anomaly` alarm rewrites its own
+name to `-High`, calls `DescribeAlarms` for that name, and drops itself if
+the twin is already in `ALARM` — no env var, no state store, no time window.
+Verified: forcing `culprit-App-High` to `ALARM` and then `culprit-App-Anomaly`
+20 s later produced exactly one dispatch, plus one `dup: culprit-App-High`
+line in the Lambda log.
 
-1. It is the left-hand widget on the dashboard — the visual that makes the
-   regression obvious on stage.
+The band still earns its place two other ways:
+
+1. It is a widget on the `Culprit` dashboard
+   (`https://console.aws.amazon.com/cloudwatch/home?region=us-east-1#dashboards:name=Culprit`)
+   — eight widgets total: a header, the real app's latency against its
+   expected band with the static threshold drawn in, an alarm-state panel
+   over all six alarms, `ErrorRate`, the EC2 host's CPU/mem/disk pulled in
+   via `SEARCH` so no instance ID is hardcoded, then this feed's own
+   `RequestLatency` against its band with its own static threshold, plus
+   `SystemLoad1` and a combined `WorkUnits`/`RequestCount` widget. It is the
+   visual that makes the regression obvious on stage.
 2. `gather_evidence.sh` queries the band expression directly via
    `get-metric-data`, so `INCIDENT.md` contains a line like
    `expected latency band: 34–48 ms; observed: 251 ms`. The agent cites it in
@@ -256,11 +334,20 @@ An `ANOMALY_DETECTION_BAND` needs **at least 3 hours** of data before it
 produces a band (AWS recommends 3 days), and backfilling does not help —
 datapoints older than 24 h take up to 48 h to become readable. Until the band
 exists the alarm sits in `INSUFFICIENT_DATA`, and with
-`TreatMissingData: notBreaching` it reports **OK forever and never tells you
-it is broken**.
+`TreatMissingData: notBreaching` it would report **OK forever and never tell
+you it is broken**. The deployed anomaly alarm therefore uses
+`TreatMissingData: missing`, which leaves the untrained state visible instead
+of disguising it as health.
 
-Mitigation: the traffic generator runs **all night at `SLEEP=15`**. That is
-what makes the band real by morning. Do not stop it.
+Mitigation: the publisher runs **all night** (`make metrics`, 10 s interval).
+That is what makes the band real by morning. Do not stop it — killing it resets
+training, and the 3-hour clock starts over.
+
+The second thing that will bite you is a **latched** alarm. `verify_chain.sh`
+forces ALARM by hand to test the wiring; a latched alarm emits no further
+OK→ALARM transition, so the next real regression dispatches nothing while every
+dashboard reads normal. The script unlatches from a `trap`. If a regression
+fires no dispatch, check `describe-alarm-history` before you touch the Lambda.
 
 ---
 
@@ -273,9 +360,14 @@ quietly.
 
 ### I1 — Metrics · W1 → W2
 
-Namespace `Culprit`. No dimensions on any metric (dimensioned metrics do not
-match dimensionless alarms — this is what broke the old dashboard). All
-published at `StorageResolution: 1`.
+Namespace `Culprit`. No dimensions on any metric in this namespace
+(dimensioned metrics do not match dimensionless alarms — this is what broke
+the old dashboard). That rule is `Culprit`-specific: the real app's metrics
+(namespace `HackathonDemo`, §3) carry `App=bad-app-ec2`, and an alarm that
+omits a dimension present on its metric matches nothing and sits in
+`INSUFFICIENT_DATA` forever — a silent failure, not a loud one. That is why
+`culprit-App-High` and `culprit-App-Anomaly` declare the dimension
+explicitly. All `Culprit` metrics are published at `StorageResolution: 1`.
 
 | Metric | Unit | Role | Behaviour during the incident |
 |---|---|---|---|
@@ -284,12 +376,31 @@ published at `StorageResolution: 1`.
 | `WorkUnits` | `Count` | **discriminator** | **flat** |
 | `RequestCount` | `Count` | rules out traffic growth | **flat** |
 
+This is the contract `scripts/seed_metrics.py` fulfills, and it is still
+live (§3, §5). W1's app landed with a second, independent metric set that
+does not conform to it: namespace `HackathonDemo`, `RequestLatency` in
+**seconds** (not milliseconds), plus `ErrorRate`, both dimensioned
+`App=bad-app-ec2`. It has no `WorkUnits`/`RequestCount` equivalent, which is
+part of why the `Culprit` feed above was kept running rather than retired —
+see §5.
+
 ### I2 — Dispatch payload · W2 → W3
 
 `POST /repos/{owner}/{repo}/dispatches`, `event_type: "anomaly"`. GitHub caps
-`client_payload` at **10 top-level properties** and 64 KB. We use 9. A sample
-lives at `docs/contracts/dispatch-payload.json` so W3 can replay it via
-`gh workflow run` before the Lambda exists.
+`client_payload` at **10 top-level properties** and 64 KB. We use all 10, so
+this contract is **full** — anything new folds into `evidence`, it does not
+become an 11th key. A sample lives at `docs/contracts/dispatch-payload.json`
+so W3 can replay it before the Lambda exists; the upstream EventBridge event
+the Lambda parses to produce it is at `docs/contracts/eventbridge-alarm-event.json`.
+
+One Lambda serves both feeds. `metric_name`, `namespace`, and the query
+period are read from `detail.configuration.metrics[].metricStat` on the
+EventBridge alarm-state-change event, not from Lambda environment variables
+— so the function always reports the metric that actually fired rather than
+one hardcoded per alarm. The sample below is a `Culprit`-feed alarm; a
+`HackathonDemo`-feed alarm produces the same shape with
+`"namespace": "HackathonDemo"`, `alarm_name` one of `culprit-App-High` /
+`culprit-App-Anomaly`, and `evidence` built from `ErrorRate`.
 
 ```json
 {
@@ -301,9 +412,40 @@ lives at `docs/contracts/dispatch-payload.json` so W3 can replay it via
   "threshold":     "95.0",
   "datapoints":    "[251.3, 248.9, 40.2, 39.8]",
   "region":        "us-east-1",
-  "dashboard_url": "https://console.aws.amazon.com/cloudwatch/..."
+  "dashboard_url": "https://console.aws.amazon.com/cloudwatch/...",
+  "evidence":      "{\"RequestLatency\": {\"before\": 37.957, \"now\": 242.078, \"change\": \"+538%\"}, \"SystemLoad1\": {\"before\": 0.752, \"now\": 2.523, \"change\": \"+236%\"}, \"WorkUnits\": {\"before\": 4000.0, \"now\": 4000.0, \"change\": \"flat\"}, \"RequestCount\": {\"before\": 20.0, \"now\": 20.0, \"change\": \"flat\"}}"
 }
 ```
+
+`datapoints` and `evidence` are JSON-encoded **strings**, not objects — every
+`client_payload` value has to be a scalar.
+
+`evidence` is the discriminator, and it is the reason the payload is worth more
+than an alert. The Lambda runs a single
+`SEARCH('Namespace="<ns>"', 'Average', <period>)` against whichever
+namespace raised the alarm and compares each metric it finds across two
+windows: `now` is the last ~30 s, `before` is the ~5 min preceding the
+incident. Both windows are expressed as *durations* and converted to
+datapoint counts from the alarm's own period (`max(1, 30 // p)` and
+`max(1, 300 // p)`), so they mean the same span whether the feed publishes
+every 10 s or every 60 s.
+
+The sweep is namespace-wide and dimension-agnostic, which buys two things. A
+metric a teammate starts publishing into that namespace shows up in
+`evidence` with no Lambda redeploy. And the *firing* metric is swept in
+alongside the rest — so a `Culprit`-feed alarm yields `RequestLatency`,
+`SystemLoad1`, `WorkUnits` and `RequestCount`, and the agent learns the
+magnitude of the regression (`+538%` in the captured sample), not merely
+that a threshold was crossed. A `HackathonDemo`-feed alarm yields
+`RequestLatency` and `ErrorRate`; the host metrics live in the separate
+`HackathonDemo/System` namespace and are not swept in.
+
+Latency and load rose; work and traffic did not move. That single object is
+what takes the agent from "something is slow" to "the same work on the same
+traffic now costs more, so look at the commits." Gathering it **in the Lambda,
+at alarm time** rather than in the Actions runner means the evidence is
+captured at the moment of the incident and W3's workflow needs no AWS
+credentials for the core narrative.
 
 ### I3 — Verdict · W3 → the gate
 
@@ -342,9 +484,34 @@ same file in the same hour.
 | | Workstream | Owns these paths, exclusively | Blocked by |
 |---|---|---|---|
 | **W1** | The app & the box | `app/`, EC2, systemd units, instance profile | nothing |
-| **W2** | Detection & dispatch | `template.yaml`, `scripts/calibrate.sh`, `scripts/deploy.sh` | W1 for calibration only |
+| **W2** | Detection & dispatch — **BUILT, both feeds live** | `infra/detection.yaml`, `scripts/{seed_metrics.py,calibrate.sh,deploy_detection.sh,verify_chain.sh}`, `.github/workflows/dispatch-receipt.yml`, `docs/w2-detection.md` | **nothing** — see below |
 | **W3** | The agent | `.github/`, `scripts/gather_evidence.sh`, `scripts/test_dispatch.sh` | nothing |
 | **W4** | The incident & the demo | `scripts/seed_incident.sh`, the runbook, rehearsals | W1 |
+
+W2 turned out **not** to be blocked by W1. CloudWatch cannot tell whether a
+datapoint came from a Flask app on EC2 or from a script on a laptop, so with I1
+frozen, `scripts/seed_metrics.py` stood in for W1's app and the whole chain
+was built and proven against real CloudWatch before the app existed. W1's app
+has since landed and is alarmed (`culprit-App-High`, `culprit-App-Anomaly`,
+`culprit-App-ErrorRate` on namespace `HackathonDemo`), but the synthetic feed
+was not retired — it stayed on deliberately. It runs at 10 s resolution
+against the app's 60 s, it already carries hours of anomaly-band training the
+app's feed does not have, and it publishes `WorkUnits`/`RequestCount`, the
+two discriminator metrics the real app does not emit. Both feeds are now
+permanent, not sequential. Anyone else blocked on a teammate should check
+whether their upstream is really a dependency or just a data source they can
+stand in for.
+
+The one remaining gap: `culprit-App-Anomaly` sits in `INSUFFICIENT_DATA`
+until roughly 17:00Z. An anomaly band needs about 3 hours of history to
+train and the instance booted at 13:53Z. It is deliberately not backfilled —
+writing synthetic points into a teammate's real metric stream would corrupt
+the baseline the band is meant to learn, which is worse than a few hours of
+`INSUFFICIENT_DATA`.
+
+W2 also deploys a **separate stack** (`infra/detection.yaml` → `culprit-detection`)
+rather than editing `template.yaml`. Same reason, stated as a rule: single
+ownership means a new file, not a shared one. The two stacks coexist.
 
 ### On your proposed split
 
@@ -434,6 +601,13 @@ Four tabs: CloudWatch dashboard on 10-second auto-refresh · GitHub Actions ·
 the repo's Pull requests tab · a terminal where `seed_incident.sh` has
 already run and `git push origin main` is typed but **not entered**.
 
+> **SUPERSEDED — do not run from this table.** It describes the aspirational
+> push-triggered demo (real bad commit → auto-deploy → regression). What is
+> built, rehearsed and timed is in **`docs/runbook.md`**: flip the app's `cpu`
+> chaos knob, alarm in 90s–3min, dispatch within 5s. Keep this as the target
+> for after the hackathon; the numbers and the `WorkUnits` pivot below are not
+> what the payload actually carries today.
+
 | T | Do | Say |
 |---|---|---|
 | 0:00 | **press enter on the push** | "I just pushed four commits to a production service. One of them is about to make it six times slower. Nobody in this room knows which one." |
@@ -467,12 +641,17 @@ already run and `git push origin main` is typed but **not entered**.
 ## 8. Questions you will get
 
 **"Isn't your detection just a static threshold with 'anomaly' in the name?"**
-Both are live. The static one triggers because CloudWatch anomaly alarms are
-capped at a 60-second period and a five-minute demo cannot wait on it. The
-trained band is on the same metric, it is on the dashboard, and the agent
-queries it directly and cites the expected range in the PR body. The static
-threshold is a number we calibrated for this endpoint tonight; the band
-learned the distribution and would still be right next week.
+Both alarms dispatch — not just the static one. CloudWatch anomaly alarms are
+capped at a 60-second period, so the static alarm reaches `ALARM` first on
+every feed and the band follows 60–90 s later; a Lambda-side dedup (an
+`-Anomaly` alarm checks whether its `-High` twin is already in `ALARM` via
+`DescribeAlarms` and drops itself if so) is what makes racing them safe — one
+incident, one dispatch, regardless of which fires first. The trained band is
+on the same metric, it is on the dashboard, and the agent queries it directly
+and cites the expected range in the PR body. The static threshold is a
+number we calibrated for this endpoint tonight; the band learned the
+distribution, would still be right next week, and would still fire and
+dispatch on its own the day the static number stops being right.
 
 **"How is this different from AWS DevOps Agent or CloudWatch Investigations?"**
 Those reason over AWS telemetry and produce findings. Neither has repository
@@ -493,9 +672,13 @@ trained detector, and a webhook receiver. CloudWatch gives us the metric
 store, the trained model, and the event bus as one resource each. The
 interesting engineering is not in the collector.
 
-**"What does it cost to run?"** Four custom metrics, two alarms, one Lambda
-invocation per incident, one Actions runner-minute per incident. The only
-meaningful cost is the agent session, and it only runs when an alarm fires.
+**"What does it cost to run?"** Six custom metrics across two namespaces,
+three host metrics from the CloudWatch agent, six alarms, two anomaly
+detectors (one per feed), and one Lambda — the same function handles every
+alarm on either feed. One invocation per incident (the dedup check absorbs
+the case where both alarms on a feed fire), one Actions runner-minute per
+incident. The only meaningful cost is the agent session, and it only runs
+when an alarm fires.
 
 **"The agent has write access to your repo."** A classic PAT scoped to one
 repo with a one-day expiry, which only ever pushes to `auto-fix/*` branches
@@ -532,7 +715,7 @@ not so anyone else edits their files.
 | Where | Finding |
 |---|---|
 | `template.yaml:24` | `BedrockModelId` defaults to `anthropic.claude-3-5-sonnet-20241022-v2:0`, which **AWS retired on 2025-10-28**. The first real invoke throws. Needs a current model ID, or Bedrock drops out entirely if the agent moves to Actions (§2). |
-| `template.yaml:111,126` | The anomaly detector and alarm watch namespace `HackathonDemo`, which has never received a datapoint. No datapoints → no trained band → the alarm sits in `INSUFFICIENT_DATA`; combined with `TreatMissingData: notBreaching` on line 143 it reports **OK forever and never signals that it is broken**. This is the single most dangerous item in the file, because it fails silently. |
+| `template.yaml:111,126` | The anomaly detector and alarm watch namespace `HackathonDemo`. That namespace is no longer dataless — it is now the real app's live namespace (§3) — so the specific failure mode described here (zero datapoints, forever) no longer applies as literally read. The underlying defect in `template.yaml` still stands: a freshly trained detector sits in `INSUFFICIENT_DATA` for its first ~3 hours regardless, and `template.yaml`'s `TreatMissingData: notBreaching` on line 126 reports **OK during that window and never signals that it is broken**. `infra/detection.yaml` — the stack actually deployed — uses `TreatMissingData: missing` on its band alarms for exactly this reason: an untrained band should read as visibly broken, not as healthy. |
 | `lambda/git_context.py:33,39` | `/commits?until={alarm_ts}&per_page=1` returns the newest commit *at or before* the alarm — which is the bad one — and it is labelled `good_sha`. It is then fed to `compare/{good_sha}...HEAD`, so the suspect becomes the baseline and **the diff comes back empty**. Needs a window that starts before the incident (e.g. `since=alarm_ts - 2h`). |
 | `lambda/handler.py:45` | Early-returns on non-`ALARM` state, but the alarm has both `AlarmActions` and `OKActions` pointing at the same topic (`template.yaml:140-143`), so every recovery invokes it too. Either drop `OKActions` or make the guard deliberate. |
 
@@ -541,7 +724,7 @@ not so anyone else edits their files.
 | Where | Finding |
 |---|---|
 | `template.yaml:100-105` | `DashboardWidgetInvokePermission` grants `lambda:InvokeFunction` to `cloudwatch.amazonaws.com` with **no `SourceAccount` or `SourceArn`** — any CloudWatch principal can invoke it. Separately, a Lambda-backed custom widget makes **every dashboard viewer click through an IAM trust prompt** before it renders. On stage that dialog is the demo. |
-| `template.yaml:172-174` | The dashboard references `ErrorRate`, `mem_used_percent`, and `disk_used_percent` **without dimensions**, while the CloudWatch agent publishes the latter two *with* host/path/device dimensions. Those widgets render empty. `ErrorRate` has no publisher at all. |
+| `template.yaml:172-174` | The dashboard references `ErrorRate`, `mem_used_percent`, and `disk_used_percent` **without dimensions**, while the CloudWatch agent publishes the latter two *with* host/path/device dimensions, and — now that W1's app has landed — the real app publishes `ErrorRate` dimensioned `App=bad-app-ec2`. All three widgets still render empty against a dimensionless query, but the reason has shifted: it is no longer that nothing publishes them, it is that the widget's metric selector and the metric's dimension disagree. The `Culprit` dashboard built for the deployed stack (§3) avoids this by using `SEARCH` for the host metrics and declaring `App=bad-app-ec2` explicitly for the app metrics. |
 | `infra/cloudwatch-agent/config.json` | Collects only `mem` and `disk`. There is **no `cpu` block**, yet the dashboard and the design both assume CPU. Also at 60s interval, which is too coarse to see a spike inside a 5-minute demo. |
 | `lambda/notify.py:39` | Persists the verdict by calling `UpdateFunctionConfiguration` **on its own function**. That races concurrent invokes, forces a cold start on every write, and the env filter can silently drop later variables. State belongs in S3, DynamoDB, or the PR body itself. |
 
@@ -553,7 +736,7 @@ disagreement is explicit rather than discovered at 3 a.m.
 | Current | The case for changing it |
 |---|---|
 | SNS topic + email subscription | Email is not a demoable artifact and cannot be clicked on stage. EventBridge → Lambda → `repository_dispatch` produces a PR instead, and a PR is the whole payoff (§2). |
-| `infra/demo-app/bad_app.py` + `scripts/trigger_chaos.sh` — a chaos flag that toggles slowness | A toggle is a switch, not a regression, and a judge will say so. §1's accidentally-quadratic commit is a real bug that passes every test and is only visible in telemetry — which is the entire argument for the project. This is the change that most affects how the demo lands. |
+| `infra/demo-app/bad_app.py` + `scripts/trigger_chaos.sh` — a chaos flag that toggles slowness | **Partly overtaken by events: the chaos toggle IS the demo trigger tonight** (`decisions.md` §1), because it is the only trigger that exists and works. `scripts/trigger_chaos.sh` itself never worked — it curls HTTP routes the app does not have — and is superseded by `scripts/chaos.sh`, which drives SSM. The argument below still stands as the *post-hackathon* target: a toggle is a switch, not a regression, and a judge may say so. §1's accidentally-quadratic commit is a real bug that passes every test and is only visible in telemetry — which is the entire argument for the project. This is the change that most affects how the demo lands. |
 | SAM (`samconfig.toml`, `scripts/deploy.sh`) | `sam build` needs Docker and an S3 artifact bucket. Plain CFN with an inline `ZipFile` handler needs neither — one `aws cloudformation deploy`, no build step, on a 10-hour clock. |
 | Bedrock invoked from a Lambda | A Lambda has no repo checkout, no git history, no `gh` auth, and no push credentials. GitHub Actions has all four already (§2). |
 

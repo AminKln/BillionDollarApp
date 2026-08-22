@@ -16,3 +16,6 @@ cdk.out/
 # OS / editor
 .DS_Store
 Thumbs.db
+
+# local process state (pids, logs from scripts/seed_metrics.py)
+.run/

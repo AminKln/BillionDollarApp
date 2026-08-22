@@ -1,0 +1,51 @@
+# W2's proof of receipt. Not the agent.
+#
+# This exists so the detection chain can be proven end to end before W3's
+# agent workflow exists: alarm -> EventBridge -> Lambda -> repository_dispatch
+# -> *this runs*. It only echoes what it received. If this job appears in the
+# Actions tab, every link in W2's chain is real.
+#
+# W3 owns .github/workflows/anomaly-response.yml — the one that actually
+# invokes Claude and opens the PR. Both listen for the same event_type, so
+# once that lands they run side by side and this one becomes the receipt/audit
+# trail. Delete it whenever it stops being useful.
+#
+# repository_dispatch only fires workflows that are already on the DEFAULT
+# branch. This file is useless until it is merged to main.
+name: dispatch receipt (W2)
+
+on:
+  repository_dispatch:
+    types: [anomaly]
+
+jobs:
+  receipt:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Show what the dispatch Lambda sent
+        env:
+          PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+        run: |
+          echo "$PAYLOAD" | jq .
+          {
+            echo "### Culprit alert received"
+            echo
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "$PAYLOAD" | jq -r 'to_entries[] | "| `\(.key)` | \(.value|tostring) |"'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Assert the contract W3 depends on
+        env:
+          PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+        run: |
+          # If the Lambda ever drops a field, W3's agent loses evidence
+          # silently. Fail loudly here instead.
+          missing=0
+          for f in alarm_name state_reason timestamp metric_name namespace \
+                   threshold datapoints region dashboard_url evidence; do
+            if [ "$(echo "$PAYLOAD" | jq -r --arg f "$f" 'has($f)')" != "true" ]; then
+              echo "::error::client_payload is missing '$f'"; missing=1
+            fi
+          done
+          exit $missing

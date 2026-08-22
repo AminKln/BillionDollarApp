@@ -1,15 +1,25 @@
 {
-  "_comment": "I2 — the repository_dispatch body the culprit-dispatch Lambda POSTs to /repos/{owner}/{repo}/dispatches. GitHub caps client_payload at 10 top-level properties and 64KB; we use 9. W3 replays this file with `gh workflow run` to develop the agent workflow before the Lambda exists.",
+  "_comment": "I2 - the repository_dispatch body the culprit-dispatch Lambda POSTs to /repos/{owner}/{repo}/dispatches. Captured VERBATIM from a real regression of the real EC2 app (CloudWatch log /aws/lambda/culprit-dispatch, 2026-08-22T17:20:33Z, chaos cpu=on). Replay it to develop W3's workflow without waiting for an alarm. GitHub caps client_payload at 10 top-level properties and 64KB; we use all 10, so this contract is FULL - anything new must fold into `evidence`, not become an 11th key. `evidence` and `datapoints` are JSON-encoded STRINGS, not objects, because every client_payload value must be a scalar.",
+
+  "_comment_shape": "SHAPE IS FEED-INDEPENDENT. The Lambda reads namespace, metric_name and period from the alarm's own configuration on the EventBridge event, so the same 10 keys arrive whichever alarm fires. Two feeds exist: the REAL app (namespace=HackathonDemo, alarms culprit-App-High / culprit-App-Anomaly, RequestLatency in SECONDS, ~0.05 healthy) - this is the demo - and a synthetic seed feed (namespace=Culprit, alarms culprit-Latency-High / culprit-Latency-Anomaly, RequestLatency in MILLISECONDS, ~40 healthy) kept only as a live fallback. Do not hardcode either unit: read `namespace` to know which feed you are looking at.",
+
+  "_comment_evidence_keys": "!! READ THIS BEFORE PARSING `evidence` !! The keys are CloudWatch SEARCH labels, which are FULLY QUALIFIED: namespace, then each dimension value, then the metric name, space-separated - e.g. 'HackathonDemo/System cpu-total i-091814f7a41456cb0 cpu_usage_active'. They are NOT bare metric names, and the instance id in them changes if the box is replaced. Do NOT do evidence['RequestLatency'] - it will KeyError. Match on the last token, or substring-match the metric name: [v for k, v in evidence.items() if k.endswith('cpu_usage_active')]. This changed on 2026-08-22 when the sweep was widened to cover both namespaces; earlier captures had bare keys.",
+
+  "_comment_evidence_why": "`evidence` is the discriminator, and it is why an agent can reason about this without AWS credentials. It is gathered at alarm time by one SEARCH('Namespace=\"<ns>\" OR Namespace=\"<ns>/System\"', 'Average', <period>) - the OR is what pulls in the CloudWatch agent's host metrics alongside the app's own. It is dimension-agnostic and picks up any metric a teammate adds without a redeploy, including the firing metric itself (RequestLatency +695% here, which gives the agent the magnitude of the regression, not just the fact of it). THE STORY TO READ: RequestLatency and cpu_usage_active rose together while ErrorRate, mem_used_percent and disk_used_percent stayed flat. Same requests, same memory, no new errors - each request just burns more CPU. That is a compute regression in application code, not load, not a leak, not a failing dependency. `before` is the ~5min preceding the incident, `now` is the last ~30s; both windows are durations computed from the alarm's period, so they mean the same thing at 10s and 60s resolution.",
+
+  "_comment_caveat": "TWO CAVEATS for anyone regenerating or consuming this. (1) `threshold` and `datapoints` come from state.reasonData, which CloudWatch only populates for a genuine evaluation. Forcing an alarm with `aws cloudwatch set-alarm-state` produces no reasonData, so both fields come back empty strings. That is the test harness, not a Lambda bug - regenerate from a real threshold crossing, as this one was. (2) ONE INCIDENT CAN DISPATCH TWICE. The -Anomaly and -High alarms watch the same metric; the Lambda drops an -Anomaly dispatch only if its -High twin is ALREADY in ALARM. In this capture the anomaly band tripped 5s BEFORE the static threshold, so both fired: culprit-App-Anomaly at 17:20:28 and culprit-App-High at 17:20:33. W3's workflow must tolerate two runs for one regression - dedupe on a short window, or make the PR/issue idempotent.",
+
   "event_type": "anomaly",
   "client_payload": {
-    "alarm_name": "culprit-Latency-High",
-    "state_reason": "Threshold Crossed: 2 out of 2 datapoints [251.34 (22/08/26 09:14:00), 248.91 (22/08/26 09:13:50)] were greater than the threshold (95.0).",
-    "timestamp": "2026-08-22T09:14:02.451Z",
+    "alarm_name": "culprit-App-High",
+    "state_reason": "Threshold Crossed: 1 out of the last 1 datapoints [2.0601465613753707 (22/08/26 17:19:00)] was greater than the threshold (0.5) (minimum 1 datapoint for OK -> ALARM transition).",
+    "timestamp": "2026-08-22T17:20:33.259+0000",
     "metric_name": "RequestLatency",
-    "namespace": "Culprit",
-    "threshold": "95.0",
-    "datapoints": "[251.34, 248.91, 40.22, 39.87]",
+    "namespace": "HackathonDemo",
+    "threshold": "0.5",
+    "datapoints": "[2.0601465613753707]",
     "region": "us-east-1",
-    "dashboard_url": "https://console.aws.amazon.com/cloudwatch/home?region=us-east-1#dashboards:name=Culprit"
+    "dashboard_url": "https://console.aws.amazon.com/cloudwatch/home?region=us-east-1#dashboards:name=Culprit",
+    "evidence": "{\"HackathonDemo bad-app-ec2 ErrorRate\": {\"before\": 0.0, \"now\": 0.0, \"change\": \"flat\"}, \"HackathonDemo bad-app-ec2 RequestLatency\": {\"before\": 0.259, \"now\": 2.059, \"change\": \"+695%\"}, \"HackathonDemo/System cpu-total i-091814f7a41456cb0 cpu_usage_active\": {\"before\": 9.685, \"now\": 27.401, \"change\": \"+183%\"}, \"HackathonDemo/System i-091814f7a41456cb0 mem_used_percent\": {\"before\": 41.188, \"now\": 41.276, \"change\": \"flat\"}, \"HackathonDemo/System nvme0n1p1 xfs i-091814f7a41456cb0 / disk_used_percent\": {\"before\": 30.565, \"now\": 30.565, \"change\": \"flat\"}}"
   }
 }

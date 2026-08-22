@@ -17,7 +17,7 @@ PIP     := $(VENV)/bin/pip
 REQS    := $(wildcard requirements.txt app/requirements.txt infra/demo-app/requirements.txt)
 
 .DEFAULT_GOAL := help
-.PHONY: help setup install check smoke clean setup-gh setup-awscli
+.PHONY: help setup install check smoke clean setup-gh setup-awscli metrics metrics-stop metrics-status regress recover calibrate deploy verify logs alarms dashboard destroy
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -30,7 +30,28 @@ help:
 	@echo "  make smoke      de-risk the GitHub half (needs GITHUB_TOKEN)"
 	@echo "  make clean      remove $(VENV) and __pycache__"
 	@echo
+	@echo "W2 — detection & dispatch:"
+	@echo "  make deploy         alarms + anomaly detectors + EventBridge + dispatch Lambda"
+	@echo "  make alarms         state of every alarm, both feeds"
+	@echo "  make dashboard      the CloudWatch dashboard URL"
+	@echo "  make logs           tail the dispatch Lambda"
+	@echo
+	@echo "  demo against the REAL EC2 app (this is the one to show):"
+	@echo "    make app-status     is it reachable, is chaos on?"
+	@echo "    make app-regress    latency 0.05s -> 1.5-3.0s  -> alarm  -> dispatch"
+	@echo "    make app-recover    turn it back off — SHARED BOX, do not skip"
+	@echo
+	@echo "  demo against the synthetic feed (faster, needs no EC2):"
+	@echo "    make metrics        start the rehearsal metric stream (leave running)"
+	@echo "    make metrics-status is it alive, and is data landing in CloudWatch?"
+	@echo "    make calibrate      derive the alarm threshold from observed data"
+	@echo "    make verify         prove the chain end to end (forces an alarm)"
+	@echo "    make regress        flip it slow  -> alarm fires  -> dispatch"
+	@echo "    make recover        flip it back healthy"
+	@echo "  make metrics-stop / destroy"
+	@echo
 	@echo "First time on a new machine:  make setup && make install && make check"
+	@echo "W2 from scratch:              make metrics && make calibrate && make deploy && make verify"
 
 # ── system dependencies ──────────────────────────────────────────────────────
 
@@ -57,15 +78,37 @@ setup-gh:
 	fi
 
 # apt ships AWS CLI v1; we need v2. That only comes from the bundled installer.
+# AWS CLI v1 is in the Ubuntu 20.04 archive (1.18, from 2020) and v2 is not.
+# Installing v2 does NOT remove v1: apt's copy stays at /usr/bin/aws, v2 lands
+# in /usr/local/bin/aws, and which one you get depends on PATH order. Worse,
+# the apt package survives and any later `apt install/upgrade` reasserts it.
+# So: remove v1 from every place it can hide, THEN install v2, THEN prove the
+# thing on PATH is actually v2 -- an unverified install is how you end up
+# debugging a v1-only error message against v2 documentation.
 setup-awscli:
 	@if aws --version 2>&1 | grep -q 'aws-cli/2'; then \
-		echo "==> aws cli v2 already installed ($$(aws --version 2>&1))"; \
+		echo "==> aws cli v2 already on PATH ($$(aws --version 2>&1))"; \
 	else \
+		if command -v aws >/dev/null 2>&1; then \
+			echo "==> removing aws cli v1 ($$(aws --version 2>&1 | cut -d' ' -f1)) at $$(command -v aws)"; \
+		fi; \
+		dpkg -s awscli >/dev/null 2>&1 && sudo apt-get remove -y -qq awscli || true; \
+		python3 -m pip show awscli >/dev/null 2>&1 && sudo python3 -m pip uninstall -y -q awscli || true; \
+		python3 -m pip show --user awscli >/dev/null 2>&1 && python3 -m pip uninstall -y -q awscli || true; \
 		echo "==> installing aws cli v2"; \
 		curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$$(uname -m).zip" -o /tmp/awscliv2.zip; \
 		unzip -oq /tmp/awscliv2.zip -d /tmp; \
 		sudo /tmp/aws/install --update; \
 		rm -rf /tmp/awscliv2.zip /tmp/aws; \
+		hash -r 2>/dev/null || true; \
+		if aws --version 2>&1 | grep -q 'aws-cli/2'; then \
+			echo "==> aws cli v2 installed ($$(aws --version 2>&1))"; \
+		else \
+			echo "!! aws on PATH is still $$(aws --version 2>&1)"; \
+			echo "!! v2 is at /usr/local/bin/aws -- something earlier in PATH shadows it:"; \
+			echo "$$PATH" | tr ':' '\\n' | sed 's/^/     /'; \
+			exit 1; \
+		fi; \
 	fi
 
 # ── application dependencies ─────────────────────────────────────────────────
@@ -150,3 +193,123 @@ clean:
 	@rm -rf $(VENV)
 	@find . -name __pycache__ -type d -prune -exec rm -rf {} + 2>/dev/null || true
 	@echo "==> cleaned"
+
+# ---------------------------------------------------------------------------
+# W2 - detection & dispatch
+#
+# Everything below works against synthetic metrics from scripts/seed_metrics.py,
+# so the whole detection chain is buildable and demoable before W1's real app
+# exists. CloudWatch cannot tell the difference; when the real app comes online
+# you run `make metrics-stop` and nothing downstream changes.
+# ---------------------------------------------------------------------------
+PIDFILE := .run/seed_metrics.pid
+LOGFILE := .run/seed_metrics.log
+FLAG    := /tmp/culprit-regression.flag
+STACK   := culprit-detection
+REGION  ?= us-east-1
+
+metrics: $(VENV)   ## start publishing synthetic Culprit metrics (detached)
+	@mkdir -p .run
+	@if [ -f $(PIDFILE) ] && kill -0 $$(cat $(PIDFILE)) 2>/dev/null; then \
+	  echo "already running (pid $$(cat $(PIDFILE)))"; \
+	else \
+	  nohup $(PY) scripts/seed_metrics.py --mode flag --interval 10 > $(LOGFILE) 2>&1 & \
+	  echo $$! > $(PIDFILE); \
+	fi
+	@sleep 2; echo "publishing (pid $$(cat $(PIDFILE))) -> $(LOGFILE)"
+	@echo "the anomaly band needs 3+ hours of data. leave this running."
+
+metrics-stop:      ## stop the synthetic publisher
+	@if [ -f $(PIDFILE) ]; then kill $$(cat $(PIDFILE)) 2>/dev/null && echo "stopped"; \
+	  rm -f $(PIDFILE); else echo "not running"; fi
+
+metrics-status:    ## is the publisher alive, and is data landing?
+	@if [ -f $(PIDFILE) ] && kill -0 $$(cat $(PIDFILE)) 2>/dev/null; then \
+	  echo "publisher: UP (pid $$(cat $(PIDFILE)), up $$(ps -p $$(cat $(PIDFILE)) -o etime= | tr -d ' '))"; \
+	 else echo "publisher: DOWN  -> make metrics"; fi
+	@if [ -f $(FLAG) ]; then echo "mode:      REGRESSION (flag present)"; \
+	 else echo "mode:      baseline"; fi
+	@echo "last 5m of RequestLatency:"
+	@aws cloudwatch get-metric-statistics --namespace Culprit --metric-name RequestLatency \
+	  --start-time $$(date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%SZ) \
+	  --end-time $$(date -u +%Y-%m-%dT%H:%M:%SZ) --period 60 \
+	  --statistics Average Maximum SampleCount --region $(REGION) \
+	  --query 'sort_by(Datapoints,&Timestamp)[].[Timestamp,SampleCount,Average,Maximum]' \
+	  --output table 2>/dev/null || echo "  (no data)"
+	@tail -3 $(LOGFILE) 2>/dev/null
+
+regress:           ## flip the synthetic app into the slow state (fires the alarm)
+	@touch $(FLAG)
+	@echo "REGRESSION on. latency ~40ms -> ~250ms, load ~0.8 -> ~2.6,"
+	@echo "WorkUnits and RequestCount unchanged - same work, same traffic, 6x the cost."
+	@echo "culprit-Latency-High needs 2 datapoints at Period 10 => ~20-60s to ALARM."
+
+recover:           ## flip back to healthy (simulates the revert landing)
+	@rm -f $(FLAG); echo "back to baseline."
+
+# The EC2 box's public IP changes across a stop/start, so look it up by tag
+# rather than pinning it. Lazy (=), so the API call only happens if a target
+# below actually needs it.
+APP_HOST = http://$(shell aws ec2 describe-instances --region $(REGION) \
+  --filters Name=tag:Name,Values=hackathon-demo Name=instance-state-name,Values=running \
+  --query 'Reservations[0].Instances[0].PublicIpAddress' --output text 2>/dev/null):8000
+
+# The app has NO /chaos/<kind>/<state> route -- reading its source
+# (Tehreem404/bad_app_demo, app.py) shows only /, /healthz and /chaos/status,
+# and curling /chaos/latency/on against the live box returns 404. Chaos state
+# lives in SSM Parameter Store; the app re-reads all three parameters on every
+# single request, so a put-parameter takes effect on the next request with no
+# redeploy, no restart and no SSH. That is why these targets shell out to
+# scripts/chaos.sh (aws ssm put-parameter) instead of curling the app.
+
+app-status:        ## is the real EC2 app reachable, and is chaos on?
+	@echo "host: $(APP_HOST)"
+	@./scripts/chaos.sh status
+
+app-bootstrap:     ## RUN THIS ONCE: create the chaos parameters the app reads
+	@echo "The app reads three SSM parameters on every request and falls back to"
+	@echo "'off' for any that is missing. If they do not exist, chaos can never be"
+	@echo "turned on -- the app is permanently healthy and the demo has no trigger."
+	@aws ssm put-parameter --name /hackathon-demo/chaos/latency --value off --type String --overwrite >/dev/null
+	@aws ssm put-parameter --name /hackathon-demo/chaos/cpu     --value off --type String --overwrite >/dev/null
+	@aws ssm put-parameter --name /hackathon-demo/chaos/errors  --value off --type String --overwrite >/dev/null
+	@echo "created all three at 'off' -- no behaviour change, the app already"
+	@echo "behaved as if they were off. now 'make app-regress' can actually bite."
+
+app-regress:       ## flip the REAL EC2 app expensive (fires culprit-App-High)
+	@./scripts/chaos.sh cpu on
+	@echo
+	@echo "REGRESSION on: the cpu knob, not the latency knob."
+	@echo "  cpu=on runs a real 2s sha256 loop per request. latency goes"
+	@echo "  ~0.05s -> ~2.05s (40x) AND cpu_usage_active climbs on the host."
+	@echo "  the latency knob is a bare time.sleep() -- it moves latency but"
+	@echo "  leaves the CPU flat, so the evidence would say only 'it got slower'."
+	@echo "culprit-App-High is 1-of-1 at Period 60, threshold 0.5s => ~60-90s to ALARM."
+	@echo "REMEMBER: 'make app-recover' when done - this is a shared box."
+
+app-recover:       ## turn the real app's chaos back off (do not skip this)
+	@./scripts/chaos.sh off
+	@echo "app back to baseline."
+
+calibrate:         ## derive the alarm threshold from real observed data
+	@./scripts/calibrate.sh
+
+deploy:            ## deploy the detection stack (alarms + EventBridge + dispatch Lambda)
+	@./scripts/deploy_detection.sh
+
+verify:            ## prove the whole chain end to end (forces a synthetic alarm)
+	@./scripts/verify_chain.sh
+
+logs:              ## tail the dispatch Lambda's logs
+	@aws logs tail /aws/lambda/culprit-dispatch --follow --region $(REGION)
+
+alarms:            ## current state of every culprit- alarm, both feeds
+	@aws cloudwatch describe-alarms --alarm-name-prefix culprit- --region $(REGION) \
+	  --query 'MetricAlarms[].[AlarmName,StateValue,StateUpdatedTimestamp]' --output table
+
+dashboard:         ## print the CloudWatch dashboard URL
+	@echo "https://console.aws.amazon.com/cloudwatch/home?region=$(REGION)#dashboards:name=Culprit"
+
+destroy:           ## delete the detection stack (does NOT touch template.yaml's stack)
+	@aws cloudformation delete-stack --stack-name $(STACK) --region $(REGION)
+	@echo "delete requested for $(STACK)."
