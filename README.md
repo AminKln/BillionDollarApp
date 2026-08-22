@@ -1,103 +1,106 @@
-# DevOps for GenAI — Ottawa Hackathon Series 2026 — Team 06
+# Culprit
 
-## Anomaly Detection → LLM Code Review & Fix Agent
+**An app gets 6× slower. Nobody says what changed. It opens the revert PR by itself.**
 
-A system that watches an app's latency and host-level system load
-(CPU/RAM/disk), detects anomalies using CloudWatch's built-in ML anomaly
-detection, and — when one fires — automatically pulls the code diff since
-the last commit before the anomaly started, sends it to an LLM
-(Bedrock/Claude) for root-cause analysis, and gets back both a diagnosis
-**and a suggested fix**. The result is surfaced on a CloudWatch dashboard and
-sent as a notification.
+Ottawa Hackathon Series 2026 · DevOps for GenAI · 24-hour build.
 
-Stack: AWS only, kept inside free tier wherever possible. GitHub for source
-control. Amazon Bedrock (Claude) for the review agent.
+A Flask service on EC2 publishes latency, system load, request count, and
+units-of-work to CloudWatch. A commit lands that makes `/compute` accidentally
+quadratic. CloudWatch alarms on it, EventBridge fires a Lambda, the Lambda
+sends a `repository_dispatch`, and a GitHub Action runs a Claude Code session
+with the metric evidence and the git history in hand. It opens a pull request
+reverting the specific commit responsible — or files a triage issue if there
+is no repo-side cause.
 
-> This is the CloudWatch-native design — it supersedes an earlier
-> self-hosted Prometheus/Alertmanager/Grafana version. See
-> [docs/architecture.md](docs/architecture.md) section 2 for what changed
-> and why.
+The regression is a real bug (`seen = []` where it should be `seen = set()`),
+it passes every test, and it is only visible in production telemetry. That is
+the point.
 
-## How it works
+---
 
-```
-EC2: demo app + CloudWatch agent
-    (app pushes custom latency/error metrics via boto3;
-     agent reports CPU/RAM/disk)
-        │
-        ▼
-CloudWatch anomaly detection alarm
-    (built-in ML band on the latency metric — no custom threshold math)
-        │
-        ▼
-SNS topic  →  Lambda (native SNS trigger, no API Gateway / webhook parsing needed)
-        │
-        ├─▶ git_context.py   — finds last commit before the alarm's timestamp,
-        │                       fetches the diff since then via GitHub API
-        │
-        ├─▶ llm_review.py    — sends diff + anomaly context to Bedrock (Claude),
-        │                       gets back diagnosis + suggested fix as structured JSON
-        │
-        └─▶ notify.py        — updates a CloudWatch custom widget (Lambda-backed
-                                 HTML on the dashboard) with the verdict, and
-                                 publishes a second SNS notification (email)
-```
+## Read this first
 
-Full design, the AWS free-tier accounting, team split, and build order are
-in [docs/architecture.md](docs/architecture.md). Live-demo timing (CloudWatch's
-~1-minute metric resolution matters here) is in
-[docs/demo-script.md](docs/demo-script.md).
+**[`docs/architecture.md`](docs/architecture.md) is the single source of
+truth** — the design, the component specs, the interfaces between
+workstreams, the hour-by-hour build order, and the demo runbook. Everything
+else in this repo is subordinate to it.
 
-## Repo layout
+---
 
-```
-repo-root/
-├── template.yaml               # SAM template — Lambda, SNS, CloudWatch alarm, dashboard, IAM
-├── samconfig.toml
-│
-├── docs/
-│   ├── architecture.md
-│   ├── demo-script.md
-│   └── contracts/               # alarm-sns-message.json, review-result.json
-│
-├── infra/
-│   ├── cloudwatch-agent/         # config.json — mem_used_percent, disk_used_percent
-│   └── demo-app/                 # bad_app.py — pushes RequestLatency/ErrorRate via boto3
-│
-├── lambda/                       # one deployable function, modular internally
-│   ├── handler.py                 # entry point — SNS alarm path or custom-widget render path
-│   ├── git_context.py             # GitHub commit/diff lookup
-│   ├── llm_review.py              # Bedrock call — diagnosis + suggested fix
-│   └── notify.py                  # custom widget + SNS notification
-│
-└── scripts/
-    ├── deploy.sh                 # sam build && sam deploy, secrets from .env
-    ├── trigger_chaos.sh           # curl helper: flip bad_app's chaos on/off
-    └── seed_bad_commit.sh         # commits + pushes the deliberately-bad demo change
-```
+## Workstreams
 
-## Team
+Four people, four workstreams, **exclusive file ownership** — nobody edits a
+path they do not own.
 
-| Person | Owns | Depends on |
-|---|---|---|
-| A — Infra/metrics | EC2 setup, CloudWatch agent config, demo app deployment | Nothing — starts immediately |
-| B — AWS scaffolding | SAM template: Lambda, SNS, CloudWatch alarm + anomaly detection, IAM | Nothing blocking — can scaffold against `docs/contracts/` immediately |
-| C — Git integration | `lambda/git_context.py` | A repo with commit history |
-| D — LLM agent + payoff | `lambda/llm_review.py`, `lambda/notify.py`, stretch: GitHub comment / draft PR | Bedrock model access request (submit first) |
+| | Workstream | Owns | Starts |
+|---|---|---|---|
+| **W1** | The app & the box | `app/`, EC2, systemd units | immediately |
+| **W2** | Detection & dispatch | `template.yaml`, `scripts/calibrate.sh`, `scripts/deploy.sh` | immediately (deploys after W1) |
+| **W3** | The agent | `.github/`, `scripts/gather_evidence.sh`, `scripts/test_dispatch.sh` | **first — zero AWS dependencies** |
+| **W4** | The incident & the demo | `scripts/seed_incident.sh`, runbook, rehearsals | after W1 |
+
+W3 goes first: it has no AWS dependency and it covers the highest-uncertainty
+integration in the system. If the GitHub chain is broken you want to know at
+19:50, not at 08:30.
+
+Full breakdown, including why "metric collection" is not its own workstream:
+[architecture.md §5](docs/architecture.md#5-workstreams).
+
+---
 
 ## Getting started
 
-1. Request Bedrock model access (biggest external dependency — do this first).
-2. Copy `.env.example` to `.env` and fill in `GITHUB_TOKEN`, `GITHUB_OWNER`,
-   `GITHUB_REPO`, `NOTIFY_EMAIL`.
-3. Launch the EC2 instance, install the CloudWatch agent using
-   `infra/cloudwatch-agent/config.json`, and run `infra/demo-app/bad_app.py`
-   (grant the instance role `cloudwatch:PutMetricData`).
-4. Deploy the stack: `./scripts/deploy.sh` (wraps `sam build && sam deploy`,
-   confirm the `BedrockModelId` parameter in `template.yaml` against your
-   actual Bedrock access first).
-5. Confirm the SNS email subscription, then use `scripts/trigger_chaos.sh`
-   to flip on latency/error chaos and watch the pipeline fire end to end.
+```bash
+# every laptop, first 15 minutes
+aws sts get-caller-identity      # must print the same account ID for all four
+gh auth status
+jq --version && python3 --version   # jq is required by test_dispatch.sh
+                                    # missing? sudo apt install -y jq
 
-See [docs/architecture.md](docs/architecture.md) for full setup notes, AWS
-free-tier accounting, and the build order.
+# W3 first, before any AWS work exists
+export GITHUB_TOKEN=<classic PAT, scopes repo+workflow, 1-day expiry>
+./scripts/test_dispatch.sh       # must end with: dispatch accepted (204)
+```
+
+Pin the AWS region in team chat before anyone deploys.
+
+---
+
+## Repo layout
+
+**On disk now** — the existing scaffolding, untouched:
+
+```
+template.yaml           SAM template: alarms, anomaly detector, Lambdas, SNS, dashboard
+samconfig.toml          SAM deploy config
+lambda/                 handler.py · git_context.py · llm_review.py · notify.py
+infra/                  cloudwatch-agent/config.json · demo-app/bad_app.py
+scripts/                deploy.sh · seed_bad_commit.sh · trigger_chaos.sh
+```
+
+`docs/architecture.md` §10 lists the defects found in these files — four that
+fail at runtime, four worth fixing before the demo — with the file and line
+for each. It does not change them; the owner of each path decides.
+
+**Being added** — one owner per path, nobody edits a path they do not own:
+
+```
+app/                    W1  Flask service, /compute, metric emission, traffic generator.
+                            app/compute.py is where the regression lives.
+scripts/calibrate.sh    W2  derives the alarm threshold from observed traffic
+scripts/gather_evidence.sh  W3  builds INCIDENT.md from CloudWatch + git
+scripts/test_dispatch.sh    W3  GitHub-half smoke test (already here)
+.github/workflows/      W3  anomaly-response.yml — the agent run and the verdict gate
+scripts/seed_incident.sh W4 the four commits, one of which is the culprit
+docs/architecture.md        The plan. Read it.
+docs/contracts/             dispatch-payload.json · verdict.schema.json —
+                            the frozen interfaces between workstreams.
+```
+
+## Secrets
+
+Nothing secret is committed. Repo secrets: `PAT_TOKEN`, `ANTHROPIC_API_KEY`,
+`AWS_READONLY_ACCESS_KEY_ID`, `AWS_READONLY_SECRET_ACCESS_KEY`. Stack
+parameters go via `--parameter-overrides`, never into a checked-in file. The
+PAT is classic, scoped `repo` + `workflow`, **one-day expiry**, minted from a
+named human's account with that name in the secret description.

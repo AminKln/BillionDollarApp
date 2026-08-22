@@ -1,0 +1,15 @@
+{
+  "_comment": "I2 — the repository_dispatch body the culprit-dispatch Lambda POSTs to /repos/{owner}/{repo}/dispatches. GitHub caps client_payload at 10 top-level properties and 64KB; we use 9. W3 replays this file with `gh workflow run` to develop the agent workflow before the Lambda exists.",
+  "event_type": "anomaly",
+  "client_payload": {
+    "alarm_name": "culprit-Latency-High",
+    "state_reason": "Threshold Crossed: 2 out of 2 datapoints [251.34 (22/08/26 09:14:00), 248.91 (22/08/26 09:13:50)] were greater than the threshold (95.0).",
+    "timestamp": "2026-08-22T09:14:02.451Z",
+    "metric_name": "RequestLatency",
+    "namespace": "Culprit",
+    "threshold": "95.0",
+    "datapoints": "[251.34, 248.91, 40.22, 39.87]",
+    "region": "us-east-1",
+    "dashboard_url": "https://console.aws.amazon.com/cloudwatch/home?region=us-east-1#dashboards:name=Culprit"
+  }
+}

@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "verdict.json",
+  "description": "I3 — written to the repo root by the Claude Code session before it finishes. The workflow's verify step fails the run if this file is absent, malformed, or if `url` does not resolve via `gh pr view` / `gh issue view`.",
+  "type": "object",
+  "required": ["action", "url", "confidence"],
+  "additionalProperties": false,
+  "properties": {
+    "action": {
+      "description": "What the agent produced. Anything outside this set fails the gate.",
+      "enum": ["pr", "issue", "comment"]
+    },
+    "url": {
+      "description": "The GitHub URL of the artifact. Must resolve.",
+      "type": "string",
+      "format": "uri"
+    },
+    "suspect_sha": {
+      "description": "Short SHA of the commit blamed. Omitted only when action is 'issue' and no repo-side cause was found.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{7,40}$"
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "metrics_that_moved": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "metrics_flat": {
+      "description": "The discriminator. WorkUnits and RequestCount staying flat is what rules out load and input growth.",
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "ruled_out": {
+      "description": "Other candidate commits and why each was rejected. This is what proves discrimination rather than confirmation.",
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "examples": [
+    {
+      "action": "pr",
+      "url": "https://github.com/AminKln/BillionDollarApp/pull/42",
+      "suspect_sha": "a1b2c3d",
+      "confidence": 0.9,
+      "metrics_that_moved": ["RequestLatency", "SystemLoad1"],
+      "metrics_flat": ["WorkUnits", "RequestCount"],
+      "ruled_out": [
+        "e4f5g6h refactor: extract the scoring loop into a helper — same file and hot path, but moves code without changing complexity",
+        "b7c8d9e chore: bump flask to 3.1.2 — dependency only, not in the request path",
+        "f1a2b3c feat: add build info to /healthz — different endpoint"
+      ]
+    },
+    {
+      "action": "issue",
+      "url": "https://github.com/AminKln/BillionDollarApp/issues/17",
+      "confidence": 0.4,
+      "metrics_that_moved": ["RequestLatency", "SystemLoad1"],
+      "metrics_flat": ["WorkUnits", "RequestCount"],
+      "ruled_out": ["no commits touched the request path in the alarm window"]
+    }
+  ]
+}
