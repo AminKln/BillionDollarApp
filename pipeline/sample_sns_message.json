@@ -1,0 +1,27 @@
+{
+  "_note": "Captured from a real ALARM state transition on this project's live culprit-App-Anomaly alarm via `aws cloudwatch describe-alarm-history` -- not fabricated. Shape matches docs/contracts/alarm-sns-message.json.",
+  "AlarmName": "culprit-App-Anomaly",
+  "AlarmDescription": "EC2 demo app latency outside its modeled expected band.",
+  "AWSAccountId": "537124932895",
+  "NewStateValue": "ALARM",
+  "NewStateReason": "Thresholds Crossed: 2 out of the last 2 datapoints [0.05446682934068207 (22/08/26 17:51:00), 0.05454111508545446 (22/08/26 17:50:00)] were greater than the upper thresholds [0.05342948924695477, 0.05358105251591999] (minimum 2 datapoints for OK -> ALARM transition).",
+  "StateChangeTime": "2026-08-22T17:52:28.788+0000",
+  "Region": "US East (N. Virginia)",
+  "AlarmArn": "arn:aws:cloudwatch:us-east-1:537124932895:alarm:culprit-App-Anomaly",
+  "OldStateValue": "OK",
+  "OKActions": ["arn:aws:sns:us-east-1:537124932895:culprit-alerts"],
+  "AlarmActions": ["arn:aws:sns:us-east-1:537124932895:culprit-alerts"],
+  "InsufficientDataActions": [],
+  "Trigger": {
+    "MetricName": "RequestLatency",
+    "Namespace": "HackathonDemo",
+    "StatisticType": "Statistic",
+    "Statistic": "AVERAGE",
+    "Unit": null,
+    "Dimensions": [{"name": "App", "value": "bad-app-ec2"}],
+    "Period": 60,
+    "EvaluationPeriods": 2,
+    "ComparisonOperator": "GreaterThanUpperThreshold",
+    "ThresholdMetricId": "ad2"
+  }
+}
