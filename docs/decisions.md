@@ -93,13 +93,13 @@ is the one the data actually supports.
 
 ## 4. Keep the synthetic feed running, demote it in the story
 
-`scripts/seed_metrics.py` fabricates metrics with `random.lognormvariate` —
-no HTTP, no app, no work. Per "everything should be based on the actual bad
-app," **the demo runs on the real app.** The synthetic feed is not deleted
-today for two reasons: it is what trained `culprit-Latency-Anomaly` (the only
-anomaly band with enough history to be useful), and it is a live fallback if
-the shared EC2 box dies mid-demo. It stays running, and the docs describe it
-as the fallback rig rather than the story. Delete it after the demo.
+**Superseded by §9 — the feed and everything on top of it were deleted.**
+
+The original call was to keep `scripts/seed_metrics.py` alive as a fallback rig
+and merely demote it in the narrative. That was wrong in one specific way: a
+fallback that is *wired into dispatch* is not a fallback, it is a second source
+of truth, and §9 shows two of its alarms could reach the agent. "Demote it in
+the story" does not demote it in the EventBridge rule. Deleted outright.
 
 ## 5. Three teams built three "alarm → LLM" pipelines. Keep one.
 
@@ -256,8 +256,43 @@ numbers with `random.lognormvariate`. No app, no HTTP, no work. Only
 `HackathonDemo`, the real app's own `put_metric_data`.
 
 All four dispatch-eligible alarms in the EventBridge rule used to include the
-two synthetic ones. **They are now excluded from the rule**, and
-`culprit-App-ErrorRate` was added in their place. The synthetic alarms stay
-deployed and stay on the dashboard as a fallback rig if the shared EC2 box dies
-mid-demo — but they can no longer reach the agent. A PR written about invented
-latency is worse than no PR.
+two synthetic ones. A PR written about invented latency is worse than no PR.
+
+Fixed in two steps. First the rule was narrowed to the three `culprit-App-*`
+alarms. Then — since a "fallback rig" nobody trusts is just a liability on a
+dashboard someone will screenshot — **the whole synthetic side was deleted**:
+`scripts/seed_metrics.py`, the three alarms, the `Culprit` anomaly detector, the
+`MetricNamespace` and `LatencyThresholdMs` parameters, three stack outputs and
+three dashboard widgets (8 → 5). Also deleted: `scripts/trigger_chaos.sh` (curled
+routes that do not exist and never worked), `scripts/seed_bad_commit.sh` and
+`infra/demo-app/` — the latter published to the **same `HackathonDemo` namespace
+as the real app**, so running it would have corrupted the live baseline the
+anomaly detector is trained on.
+
+Confirmed after the deploy: three alarms exist, all `culprit-App-*`, all OK; one
+anomaly detector, on `HackathonDemo/RequestLatency`.
+
+## 10. `deploy_detection.sh` was silently reverting the §8 fix
+
+The band fix in §8 changed the template's `LatencySensitivity` default from 2 to
+8. The next `make deploy` put it straight back to 2, because
+`scripts/deploy_detection.sh` carried its own `SENSITIVITY=${LATENCY_SENSITIVITY:-2}`
+and passed it explicitly — a `--parameter-overrides` value always beats the
+template default. `describe-stacks` showed `LatencySensitivity 2` on a stack
+deployed from a template whose default says 8, which is exactly as confusing to
+read as it sounds.
+
+Two more defects in the same script, found while fixing it:
+
+- It passed `MetricNamespace=` and `LatencyThresholdMs=`, deleted in §9.
+  `aws cloudformation deploy` **silently drops overrides that are not declared
+  in the template** rather than erroring, so this looked like a clean deploy.
+- `GithubOwner`/`GithubRepo` were derived from *this* repo's git remote, so every
+  dispatch targeted `AminKln/BillionDollarApp` — which has no workflow to receive
+  it. The dispatch has to land where the culprit commit and the responding
+  workflow live. Defaults are now `Tehreem404/bad_app_demo`.
+
+Lesson worth keeping: a deploy wrapper that hardcodes defaults *duplicates* the
+template's parameter defaults, and duplicated defaults drift. The wrapper should
+pass only what the operator actually chose. This one still passes everything, but
+its values now match the template and the mismatch is called out in a comment.

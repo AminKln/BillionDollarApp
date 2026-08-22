@@ -176,14 +176,25 @@ Deployed and verified today. Two defects found and fixed in the last hour:
   stack that would have been three junk PRs.** Widened to 8 stdev (band top
   0.061, ~13% headroom) and 3-of-3 datapoints. Alarm is now OK and stable.
 - **Half the alarms were watching fabricated data.** `culprit-Latency-High`,
-  `culprit-Latency-Anomaly` and `culprit-Load-High` are on the `Culprit`
+  `culprit-Latency-Anomaly` and `culprit-Load-High` were on the `Culprit`
   namespace — `seed_metrics.py` generating numbers with `random.lognormvariate`.
-  They are now **excluded from the EventBridge dispatch rule**. They stay on the
-  dashboard as a fallback rig if the shared box dies. Only the three
-  `HackathonDemo` alarms — real app — can reach the agent.
+  Two of the three were wired into dispatch, so the agent could have been handed
+  a regression that never happened. **All of it is deleted**: the publisher, the
+  three alarms, the detector, the parameters, the outputs and three dashboard
+  widgets. Every metric this stack watches now comes from the real app.
+- **`deploy_detection.sh` was quietly undoing the band fix.** It hardcoded
+  `LATENCY_SENSITIVITY:-2`, which overrode the template's own default on every
+  deploy — so the first fix deploy re-narrowed the band to the broken value.
+  Default is now 8. It also passed `MetricNamespace=` / `LatencyThresholdMs=`,
+  parameters that no longer exist; `aws cloudformation deploy` drops unknown
+  overrides silently, so this failed without failing.
+- **Dispatch retargeted.** `GithubOwner`/`GithubRepo` used to be derived from
+  *this* repo's git remote, pointing every dispatch at `BillionDollarApp`, where
+  no workflow exists to receive it. Now defaults to `Tehreem404/bad_app_demo`
+  — deployed and confirmed on the stack.
 
-Remaining: retarget the dispatch to `Tehreem404/bad_app_demo` once Lane E
-produces the token. One `make deploy`.
+Remaining: `GITHUB_TOKEN=xxx make deploy` once Lane E mints the PAT. Nothing
+else.
 
 ---
 
@@ -231,6 +242,7 @@ If we are behind at these times, cut without discussion:
 - **15:45** — dispatch still not landing → demo stops at `make payload`, which
   prints the exact evidence the agent *would* receive. The chain ran; it stopped
   one HTTP POST short, and the audience sees the diagnosis either way.
-- **Any time** — the shared EC2 box dies → the synthetic `Culprit` feed and its
-  three alarms are still live and still on the dashboard. Narrate that instead
-  and say plainly that it is a stand-in.
+- **Any time** — the shared EC2 box dies → there is no fallback feed any more
+  and there should not be one. Narrate `make payload` from the last good run
+  plus the dashboard's retained history, and say plainly that the box is down.
+  A fabricated feed on stage is worse than an honest one that stopped.

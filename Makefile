@@ -14,10 +14,10 @@ PIP     := $(VENV)/bin/pip
 
 # every requirements.txt in the repo; app/ appears once W1 adds it.
 # lambda/requirements.txt is comment-only (boto3 ships in the runtime).
-REQS    := $(wildcard requirements.txt app/requirements.txt infra/demo-app/requirements.txt)
+REQS    := $(wildcard requirements.txt app/requirements.txt)
 
 .DEFAULT_GOAL := help
-.PHONY: help setup install check smoke clean setup-gh setup-awscli metrics metrics-stop metrics-status regress recover calibrate deploy verify logs alarms dashboard destroy
+.PHONY: help setup install check smoke clean setup-gh setup-awscli calibrate deploy verify logs alarms dashboard destroy
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -32,7 +32,7 @@ help:
 	@echo
 	@echo "W2 — detection & dispatch:"
 	@echo "  make deploy         alarms + anomaly detectors + EventBridge + dispatch Lambda"
-	@echo "  make alarms         state of every alarm, both feeds"
+	@echo "  make alarms         state of every alarm"
 	@echo "  make dashboard      the CloudWatch dashboard URL"
 	@echo "  make logs           tail the dispatch Lambda"
 	@echo
@@ -41,17 +41,14 @@ help:
 	@echo "    make app-regress    latency 0.05s -> 1.5-3.0s  -> alarm  -> dispatch"
 	@echo "    make app-recover    turn it back off — SHARED BOX, do not skip"
 	@echo
-	@echo "  demo against the synthetic feed (faster, needs no EC2):"
-	@echo "    make metrics        start the rehearsal metric stream (leave running)"
-	@echo "    make metrics-status is it alive, and is data landing in CloudWatch?"
-	@echo "    make calibrate      derive the alarm threshold from observed data"
-	@echo "    make verify         prove the chain end to end (forces an alarm)"
-	@echo "    make regress        flip it slow  -> alarm fires  -> dispatch"
-	@echo "    make recover        flip it back healthy"
-	@echo "  make metrics-stop / destroy"
+	@echo "  supporting targets:"
+	@echo "    make calibrate      re-derive the alarm threshold from observed data"
+	@echo "    make verify         prove the chain end to end (forces a real alarm)"
+	@echo "    make payload        the last JSON the Lambda handed GitHub  (AWS CLI v1 ok)"
+	@echo "    make destroy        tear the stack down"
 	@echo
 	@echo "First time on a new machine:  make setup && make install && make check"
-	@echo "W2 from scratch:              make metrics && make calibrate && make deploy && make verify"
+	@echo "W2 from scratch:              make deploy && make verify"
 
 # ── system dependencies ──────────────────────────────────────────────────────
 
@@ -197,55 +194,12 @@ clean:
 # ---------------------------------------------------------------------------
 # W2 - detection & dispatch
 #
-# Everything below works against synthetic metrics from scripts/seed_metrics.py,
-# so the whole detection chain is buildable and demoable before W1's real app
-# exists. CloudWatch cannot tell the difference; when the real app comes online
-# you run `make metrics-stop` and nothing downstream changes.
+# Every target below acts on the REAL app (Tehreem404/bad_app_demo on
+# i-091814f7a41456cb0). The synthetic metric publisher and its three alarms
+# were deleted on 2026-08-22 -- see docs/decisions.md 9.
 # ---------------------------------------------------------------------------
-PIDFILE := .run/seed_metrics.pid
-LOGFILE := .run/seed_metrics.log
-FLAG    := /tmp/culprit-regression.flag
 STACK   := culprit-detection
 REGION  ?= us-east-1
-
-metrics: $(VENV)   ## start publishing synthetic Culprit metrics (detached)
-	@mkdir -p .run
-	@if [ -f $(PIDFILE) ] && kill -0 $$(cat $(PIDFILE)) 2>/dev/null; then \
-	  echo "already running (pid $$(cat $(PIDFILE)))"; \
-	else \
-	  nohup $(PY) scripts/seed_metrics.py --mode flag --interval 10 > $(LOGFILE) 2>&1 & \
-	  echo $$! > $(PIDFILE); \
-	fi
-	@sleep 2; echo "publishing (pid $$(cat $(PIDFILE))) -> $(LOGFILE)"
-	@echo "the anomaly band needs 3+ hours of data. leave this running."
-
-metrics-stop:      ## stop the synthetic publisher
-	@if [ -f $(PIDFILE) ]; then kill $$(cat $(PIDFILE)) 2>/dev/null && echo "stopped"; \
-	  rm -f $(PIDFILE); else echo "not running"; fi
-
-metrics-status:    ## is the publisher alive, and is data landing?
-	@if [ -f $(PIDFILE) ] && kill -0 $$(cat $(PIDFILE)) 2>/dev/null; then \
-	  echo "publisher: UP (pid $$(cat $(PIDFILE)), up $$(ps -p $$(cat $(PIDFILE)) -o etime= | tr -d ' '))"; \
-	 else echo "publisher: DOWN  -> make metrics"; fi
-	@if [ -f $(FLAG) ]; then echo "mode:      REGRESSION (flag present)"; \
-	 else echo "mode:      baseline"; fi
-	@echo "last 5m of RequestLatency:"
-	@aws cloudwatch get-metric-statistics --namespace Culprit --metric-name RequestLatency \
-	  --start-time $$(date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%SZ) \
-	  --end-time $$(date -u +%Y-%m-%dT%H:%M:%SZ) --period 60 \
-	  --statistics Average Maximum SampleCount --region $(REGION) \
-	  --query 'sort_by(Datapoints,&Timestamp)[].[Timestamp,SampleCount,Average,Maximum]' \
-	  --output table 2>/dev/null || echo "  (no data)"
-	@tail -3 $(LOGFILE) 2>/dev/null
-
-regress:           ## flip the synthetic app into the slow state (fires the alarm)
-	@touch $(FLAG)
-	@echo "REGRESSION on. latency ~40ms -> ~250ms, load ~0.8 -> ~2.6,"
-	@echo "WorkUnits and RequestCount unchanged - same work, same traffic, 6x the cost."
-	@echo "culprit-Latency-High needs 2 datapoints at Period 10 => ~20-60s to ALARM."
-
-recover:           ## flip back to healthy (simulates the revert landing)
-	@rm -f $(FLAG); echo "back to baseline."
 
 # The EC2 box's public IP changes across a stop/start, so look it up by tag
 # rather than pinning it. Lazy (=), so the API call only happens if a target
@@ -297,7 +251,7 @@ calibrate:         ## derive the alarm threshold from real observed data
 deploy:            ## deploy the detection stack (alarms + EventBridge + dispatch Lambda)
 	@./scripts/deploy_detection.sh
 
-verify:            ## prove the whole chain end to end (forces a synthetic alarm)
+verify:            ## prove the whole chain end to end (forces a real-app alarm)
 	@./scripts/verify_chain.sh
 
 payload:           ## show the last payload the Lambda built (DEMO FALLBACK - works on CLI v1)
@@ -310,7 +264,7 @@ logs:              ## tail the dispatch Lambda's logs (needs AWS CLI v2)
 	  exit 1; }
 	@aws logs tail /aws/lambda/culprit-dispatch --follow --region $(REGION)
 
-alarms:            ## current state of every culprit- alarm, both feeds
+alarms:            ## current state of every culprit- alarm
 	@aws cloudwatch describe-alarms --alarm-name-prefix culprit- --region $(REGION) \
 	  --query 'MetricAlarms[].[AlarmName,StateValue,StateUpdatedTimestamp]' --output table
 

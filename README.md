@@ -4,17 +4,25 @@
 
 Ottawa Hackathon Series 2026 · DevOps for GenAI · 24-hour build.
 
-A Flask service on EC2 publishes latency, system load, request count, and
-units-of-work to CloudWatch. A commit lands that makes `/compute` accidentally
-quadratic. CloudWatch alarms on it, EventBridge fires a Lambda, the Lambda
-sends a `repository_dispatch`, and a GitHub Action runs a Claude Code session
-with the metric evidence and the git history in hand. It opens a pull request
-reverting the specific commit responsible — or files a triage issue if there
-is no repo-side cause.
+A Flask service on EC2 ([`Tehreem404/bad_app_demo`](https://github.com/Tehreem404/bad_app_demo))
+publishes request latency and error rate to CloudWatch; the CloudWatch agent on
+the same box publishes CPU, memory and disk. A commit lands that makes the
+request path accidentally quadratic. CloudWatch alarms on it, EventBridge fires
+a Lambda, the Lambda queries five metrics before-and-after to build an evidence
+block, and sends a `repository_dispatch` to the app's own repo. A GitHub Action
+there runs a Claude Code session with that evidence and the git history in hand.
+It opens a pull request fixing the specific commit responsible — or files a
+triage issue if there is no repo-side cause.
 
-The regression is a real bug (`seen = []` where it should be `seen = set()`),
-it passes every test, and it is only visible in production telemetry. That is
-the point.
+The regression is a real bug — an O(n²) rank-every-item-against-every-item loop
+in a per-request scoring helper (`infra/bad-app/culprit.py.patch`, measured at
+**1.07 s/request against a 0.05 s baseline**). It passes every test and is only
+visible in production telemetry. That is the point.
+
+**Every number in this pipeline comes from the real app.** A synthetic metric
+publisher was used to build detection before the app existed; it was deleted on
+2026-08-22 because two of its alarms could dispatch, which meant the agent could
+be handed a regression that never happened (`docs/decisions.md` §9).
 
 ---
 
@@ -22,16 +30,18 @@ the point.
 
 **Demo day, in order:**
 
-1. **[`docs/decisions.md`](docs/decisions.md)** — 4 minutes. Three people built
-   overlapping pipelines; this picks one of each and says why. It also
-   documents the bug that made the demo impossible to trigger (§1) and the two
-   things W3 and W4 must change (§6). Read it before you touch anything.
+1. **[`docs/plan.md`](docs/plan.md)** — **start here.** Who runs which wire,
+   right now, and what "done" looks like for it. Read §0 and your own lane;
+   nothing else.
 2. **[`docs/runbook.md`](docs/runbook.md)** — the demo itself, minute by
-   minute, with measured timings from a real run.
-3. **[`docs/architecture.md`](docs/architecture.md)** — the design, the
-   component specs, and the interfaces between workstreams. Still the source
-   of truth for *how it works*; `decisions.md` overrides it wherever the two
-   disagree about *what we are doing tonight*.
+   minute, with measured timings from real rehearsals.
+3. **[`docs/decisions.md`](docs/decisions.md)** — 4 minutes. Three people built
+   overlapping pipelines; this picks one of each and says why. §9 and §10 are
+   the most recent and the most load-bearing.
+4. **[`docs/architecture.md`](docs/architecture.md)** — the design and the
+   interfaces between workstreams. Source of truth for *how it works*, but read
+   its superseded banner first; `decisions.md` and `plan.md` override it
+   wherever they disagree.
 
 ---
 
@@ -42,17 +52,17 @@ path they do not own.
 
 | | Workstream | Owns | Starts |
 |---|---|---|---|
-| **W1** | The app & the box | `app/`, EC2, systemd units | immediately |
-| **W2** | Detection & dispatch | `infra/detection.yaml`, `scripts/calibrate.sh`, `scripts/deploy_detection.sh` | **done — deployed and watching W1's box** |
-| **W3** | The agent | `.github/`, `scripts/gather_evidence.sh`, `scripts/test_dispatch.sh` | **first — zero AWS dependencies** |
-| **W4** | The incident & the demo | `scripts/seed_incident.sh`, runbook, rehearsals | after W1 |
+| **W1** | The app & the box | `bad_app_demo`, EC2, `deploy.sh` | live |
+| **W2** | Detection & dispatch | `infra/detection.yaml`, `scripts/{calibrate,deploy_detection,verify_chain}.sh` | **done — deployed and watching the real app** |
+| **W3** | The agent | `anomaly-response.yml` + the Claude step, in `bad_app_demo` | **critical path** |
+| **W4** | The culprit commit & the demo | `infra/bad-app/culprit.py.patch`, runbook, rehearsals | ready to apply |
 
-W3 goes first: it has no AWS dependency and it covers the highest-uncertainty
-integration in the system. If the GitHub chain is broken you want to know at
-19:50, not at 08:30.
-
-Full breakdown, including why "metric collection" is not its own workstream:
-[architecture.md §5](docs/architecture.md#5-workstreams).
+**The live task assignment is [`docs/plan.md`](docs/plan.md), not this table.**
+It splits the same work into five lanes with names against them, and it carries
+the one design decision everyone needs: the responding workflow lives in
+`bad_app_demo`, so it opens the PR with the built-in `secrets.GITHUB_TOKEN` and
+the only PAT anyone has to mint is a fine-grained, single-repo one for the
+Lambda's dispatch call.
 
 ---
 
@@ -93,8 +103,8 @@ Makefile                setup · install · check · smoke · clean
 template.yaml           SAM template: alarms, anomaly detector, Lambdas, SNS, dashboard
 samconfig.toml          SAM deploy config
 lambda/                 handler.py · git_context.py · llm_review.py · notify.py
-infra/                  cloudwatch-agent/config.json · demo-app/bad_app.py
-scripts/                deploy.sh · seed_bad_commit.sh · trigger_chaos.sh
+infra/                  cloudwatch-agent/config.json · bad-app/culprit.py.patch
+scripts/                deploy.sh · chaos.sh
 ```
 
 `docs/architecture.md` §10 lists the defects found in these files — four that
@@ -106,23 +116,21 @@ for each. It does not change them; the owner of each path decides.
 ```
 W2 — detection & dispatch (BUILT, deployed, end-to-end verified)
   infra/detection.yaml        alarms + anomaly detector + EventBridge + dispatch Lambda
-  scripts/seed_metrics.py     second feed: 10s resolution + a trained band, kept
-                              deliberately alongside the real app (see w2-detection.md)
   scripts/calibrate.sh        derives the alarm threshold from observed traffic
   scripts/deploy_detection.sh deploys the stack (separate from template.yaml by design)
   scripts/verify_chain.sh     8 checks; proves the chain without waiting for a regression
   .github/workflows/dispatch-receipt.yml  proof the payload arrives (not W3's agent)
-  docs/w2-detection.md        how it works, what is still fake, and what replaces it
+  docs/w2-detection.md        how it works (carries its own historical banner)
 
-Still to come — one owner per path:
-  app/                        W1  the Flask service is LIVE on EC2 and alarmed
-                                  (i-091814f7a41456cb0), but its source is not in
-                                  this repo yet. W4 needs it here to plant a culprit
-                                  commit, and W3 needs it to open a PR against.
-  scripts/gather_evidence.sh  W3  builds INCIDENT.md from CloudWatch + git
-  scripts/test_dispatch.sh    W3  GitHub-half smoke test (already here)
-  .github/workflows/anomaly-response.yml  W3  the agent run and the verdict gate
-  scripts/seed_incident.sh    W4  the four commits, one of which is the culprit
+Still to come — and most of it now lives in the OTHER repo:
+  Tehreem404/bad_app_demo:
+    the culprit commit             W4  apply infra/bad-app/culprit.py.patch, push
+    .github/workflows/anomaly-response.yml   W3  receives the dispatch, runs Claude
+    Settings > Secrets: ANTHROPIC_API_KEY    W1  repo owner
+    deploy.sh                      W1  exists on the EC2 box only; capture it verbatim
+
+  here:
+    GITHUB_TOKEN=… make deploy     W2  once the fine-grained PAT exists
 
   docs/decisions.md               What we keep, what we drop, who does what.
   docs/runbook.md                 The demo, minute by minute.
@@ -132,22 +140,30 @@ Still to come — one owner per path:
                                   interfaces between workstreams.
 ```
 
-W2 is deployed and needs nothing from anyone. Six alarms across two feeds —
-W1's real app on EC2 and a synthetic high-resolution feed we control — all
-converge on one EventBridge rule and one Lambda, and `make verify` proves the
+W2 is deployed and needs nothing from anyone. Three alarms, all on the real
+app — `culprit-App-High` (static, the trigger), `culprit-App-Anomaly` (ML
+band) and `culprit-App-ErrorRate` (corroboration, does not dispatch) —
+converge on one EventBridge rule and one Lambda. `make verify` proves the
 alarm → EventBridge → Lambda → payload chain against real CloudWatch without
-waiting for a regression. Watch it at the `Culprit` dashboard (`make dashboard`).
+waiting for a regression, and `make payload` prints the exact JSON the Lambda
+last handed GitHub. Watch it at the `Culprit` dashboard (`make dashboard`).
 
-One thing is still missing, and it is not ours: the Lambda has no
-`GITHUB_TOKEN`, so it logs the payload it would have POSTed instead of sending
-it. W3 mints the PAT; completing the chain is then one redeploy
-(`GITHUB_TOKEN=… make deploy`). See `docs/w2-detection.md` for the full gap
-register.
+One thing is still missing: the Lambda has no `GITHUB_TOKEN`, so it logs the
+payload it would have POSTed instead of sending it. Completing the chain is one
+redeploy — `GITHUB_TOKEN=… make deploy` — as soon as the fine-grained PAT
+exists (`docs/plan.md` Lane E).
 
 ## Secrets
 
-Nothing secret is committed. Repo secrets: `PAT_TOKEN`, `ANTHROPIC_API_KEY`,
-`AWS_READONLY_ACCESS_KEY_ID`, `AWS_READONLY_SECRET_ACCESS_KEY`. Stack
-parameters go via `--parameter-overrides`, never into a checked-in file. The
-PAT is classic, scoped `repo` + `workflow`, **one-day expiry**, minted from a
-named human's account with that name in the secret description.
+Nothing secret is committed, and nothing secret should be. Two tokens exist:
+
+- **`ANTHROPIC_API_KEY`** — a repo secret in `Tehreem404/bad_app_demo`, for the
+  agent. Set it through the GitHub web UI; never put it in a file.
+- **One fine-grained PAT** for the Lambda's `repository_dispatch` — scoped to
+  `bad_app_demo` only, **Contents: read/write**, **1-day expiry**. It reaches
+  the stack as `GITHUB_TOKEN=xxx make deploy` and is declared `NoEcho` in the
+  template. Never into a checked-in file.
+
+`GITHUB_TOKEN` inside the workflow is GitHub's own auto-injected token — it
+needs no setup and is sufficient to open the PR, because the workflow lives in
+the repo it writes to. Stack parameters always go via `--parameter-overrides`.

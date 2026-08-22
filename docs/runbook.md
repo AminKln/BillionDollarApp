@@ -76,19 +76,16 @@ indistinguishable from a slow database. Same alarm, no diagnosis.
   traffic generator is a closed loop, so slower requests mean fewer requests.
   Do not claim traffic held steady; the dashboard shows otherwise. It does not
   weaken the story — CPU per request is what moved.
-- **The dashboard is named `Culprit` but covers both feeds** — its top three
-  widgets are the EC2 app's latency, error rate and host CPU/mem/disk, and the
-  synthetic widgets sit below them. So the `dashboard_url` in the payload is
-  correct even for a `HackathonDemo` alarm; only the name is confusing. Scroll
-  to the top three widgets on stage and ignore the rest.
-- **One regression can fire two dispatches.** `culprit-App-Anomaly` and
-  `culprit-App-High` watch the same metric. The Lambda suppresses the anomaly
-  one only if `-High` is *already* red — and in rehearsal #2 the anomaly band
-  tripped **5 seconds first** (17:20:28 vs 17:20:33), so both went out. Expect
-  up to two Actions runs for one incident. If two PRs appear on stage, that is
-  this, not a bug in the agent. W3 dedupes; see `contracts/dispatch-payload.json`.
-- **The synthetic `Culprit` feed is still running** as a fallback rig if the
-  shared EC2 box dies mid-demo. It is not the story. See `decisions.md` §4.
+- **The dashboard is named `Culprit`** — that is the stack's name, not a
+  feed's. Every widget on it is the real app: latency, error rate, the anomaly
+  band, and host CPU/mem/disk. The three synthetic widgets that used to sit
+  below them are gone (`decisions.md` §9).
+- **One regression used to fire two dispatches.** `culprit-App-Anomaly` and
+  `culprit-App-High` watch the same metric, and in rehearsal #2 the band tripped
+  **5 seconds first** (17:20:28 vs 17:20:33), so both went out. Fixed at the
+  alarm layer: the anomaly alarm is now 3-of-3 at a 60s period, so it needs
+  three minutes and can never beat the 1-of-1 static alarm. One regression, one
+  dispatch. If two Actions runs still appear, that is a real bug — say so.
 
 ## If it breaks on stage
 

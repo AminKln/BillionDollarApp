@@ -12,17 +12,27 @@
 # AWS CLI errors, so this is safe to run at any point in the build.
 set -uo pipefail
 
-NAMESPACE=${NAMESPACE:-Culprit}
+NAMESPACE=${NAMESPACE:-HackathonDemo}
 REGION=${REGION:-us-east-1}
 STACK=${STACK:-culprit-detection}
 DASHBOARD_NAME=${DASHBOARD_NAME:-Culprit}
 
+# The app's metrics are dimensioned. A get-metric-data query with NO Dimensions
+# does not match a dimensioned metric -- it silently returns zero datapoints and
+# every check below reads as "the publisher is dead." Keep these in sync with
+# AppDimensionName/AppDimensionValue in infra/detection.yaml.
+DIM_NAME=${DIM_NAME:-App}
+DIM_VALUE=${DIM_VALUE:-bad-app-ec2}
+# Must match LatencySensitivity in infra/detection.yaml or check 4 reports a
+# band the deployed alarm is not actually using.
+SENSITIVITY=${SENSITIVITY:-8}
+
 # Fallback names — used only if the stack is deployed but a particular
 # Output happens to be missing. When the stack isn't deployed at all these
 # are never consulted (checks 3-8 skip outright).
-DEFAULT_STATIC_ALARM=culprit-Latency-High
-DEFAULT_ANOMALY_ALARM=culprit-Latency-Anomaly
-DEFAULT_LOAD_ALARM=culprit-Load-High
+DEFAULT_STATIC_ALARM=culprit-App-High
+DEFAULT_ANOMALY_ALARM=culprit-App-Anomaly
+DEFAULT_ERROR_ALARM=culprit-App-ErrorRate
 DEFAULT_RULE_NAME=culprit-alarm-state-change
 DEFAULT_DISPATCH_FN=culprit-dispatch
 DEFAULT_DISPATCH_LOG_GROUP=/aws/lambda/culprit-dispatch
@@ -50,18 +60,19 @@ if [ $? -ne 0 ]; then
   bad "list-metrics failed:"
   echo "$METRICS_JSON"
 else
-  for m in RequestLatency SystemLoad1 WorkUnits RequestCount; do
+  for m in RequestLatency ErrorRate; do
     if printf '%s' "$METRICS_JSON" | jq -e --arg m "$m" '[.Metrics[].MetricName] | index($m) != null' >/dev/null 2>&1; then
       ok "metric present: $m"
     else
-      bad "metric MISSING: $m — is scripts/seed_metrics.py running?"
+      bad "metric MISSING: $m — is the Flask app up on the EC2 box? (make app-status)"
     fi
   done
 
   END=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   START=$(date -u -d '-5 minutes' +%Y-%m-%dT%H:%M:%SZ)
-  RQ=$(jq -n --arg ns "$NAMESPACE" '[{Id: "lat", MetricStat: {Metric: {Namespace: $ns, MetricName: "RequestLatency"},
-        Period: 60, Stat: "Average"}, ReturnData: true}]')
+  RQ=$(jq -n --arg ns "$NAMESPACE" --arg dn "$DIM_NAME" --arg dv "$DIM_VALUE" \
+        '[{Id: "lat", MetricStat: {Metric: {Namespace: $ns, MetricName: "RequestLatency",
+        Dimensions: [{Name: $dn, Value: $dv}]}, Period: 60, Stat: "Average"}, ReturnData: true}]')
   RECENT=$(aws cloudwatch get-metric-data --region "$REGION" --start-time "$START" --end-time "$END" \
             --metric-data-queries "$RQ" --output json 2>&1)
   if [ $? -ne 0 ]; then
@@ -72,7 +83,7 @@ else
     if [ "$CNT" -gt 0 ]; then
       ok "RequestLatency has $CNT datapoint(s) in the last 5 minutes — publisher is alive"
     else
-      bad "RequestLatency has NO datapoints in the last 5 minutes — publisher looks dead. Start ./scripts/seed_metrics.py"
+      bad "RequestLatency has NO datapoints in the last 5 minutes — the app is not publishing. Check make app-status"
     fi
   fi
 fi
@@ -100,9 +111,9 @@ else
       ;;
   esac
 
-  StaticAlarmName=$(printf '%s' "$STACK_JSON" | jq -r '.Stacks[0].Outputs[]? | select(.OutputKey=="StaticAlarmName") | .OutputValue')
-  AnomalyAlarmName=$(printf '%s' "$STACK_JSON" | jq -r '.Stacks[0].Outputs[]? | select(.OutputKey=="AnomalyAlarmName") | .OutputValue')
-  LoadAlarmName=$(printf '%s' "$STACK_JSON" | jq -r '.Stacks[0].Outputs[]? | select(.OutputKey=="LoadAlarmName") | .OutputValue')
+  StaticAlarmName=$(printf '%s' "$STACK_JSON" | jq -r '.Stacks[0].Outputs[]? | select(.OutputKey=="AppStaticAlarmName") | .OutputValue')
+  AnomalyAlarmName=$(printf '%s' "$STACK_JSON" | jq -r '.Stacks[0].Outputs[]? | select(.OutputKey=="AppAnomalyAlarmName") | .OutputValue')
+  ErrorRateAlarmName=$(printf '%s' "$STACK_JSON" | jq -r '.Stacks[0].Outputs[]? | select(.OutputKey=="AppErrorRateAlarmName") | .OutputValue')
   RuleName=$(printf '%s' "$STACK_JSON" | jq -r '.Stacks[0].Outputs[]? | select(.OutputKey=="RuleName") | .OutputValue')
   DispatchFunctionName=$(printf '%s' "$STACK_JSON" | jq -r '.Stacks[0].Outputs[]? | select(.OutputKey=="DispatchFunctionName") | .OutputValue')
   DispatchLogGroupName=$(printf '%s' "$STACK_JSON" | jq -r '.Stacks[0].Outputs[]? | select(.OutputKey=="DispatchLogGroupName") | .OutputValue')
@@ -114,14 +125,14 @@ else
   echo "     DispatchLogGroupName = ${DispatchLogGroupName:-<missing>}"
   echo "     StaticAlarmName      = ${StaticAlarmName:-<missing>}"
   echo "     AnomalyAlarmName     = ${AnomalyAlarmName:-<missing>}"
-  echo "     LoadAlarmName        = ${LoadAlarmName:-<missing>}"
+  echo "     ErrorRateAlarmName   = ${ErrorRateAlarmName:-<missing>}"
   echo "     RuleName             = ${RuleName:-<missing>}"
   echo "     DashboardUrl         = ${DashboardUrl:-<missing>}"
   echo "     AlertTopicArn        = ${AlertTopicArn:-<missing>}"
 fi
 : "${StaticAlarmName:=$DEFAULT_STATIC_ALARM}"
 : "${AnomalyAlarmName:=$DEFAULT_ANOMALY_ALARM}"
-: "${LoadAlarmName:=$DEFAULT_LOAD_ALARM}"
+: "${ErrorRateAlarmName:=$DEFAULT_ERROR_ALARM}"
 : "${RuleName:=$DEFAULT_RULE_NAME}"
 : "${DispatchFunctionName:=$DEFAULT_DISPATCH_FN}"
 : "${DispatchLogGroupName:=$DEFAULT_DISPATCH_LOG_GROUP}"
@@ -135,7 +146,7 @@ if [ "$STACK_DEPLOYED" != 1 ]; then
   skip "alarms — stack not deployed"
 else
   ALARMS_JSON=$(aws cloudwatch describe-alarms --region "$REGION" \
-    --alarm-names "$StaticAlarmName" "$AnomalyAlarmName" "$LoadAlarmName" --output json 2>&1)
+    --alarm-names "$StaticAlarmName" "$AnomalyAlarmName" "$ErrorRateAlarmName" --output json 2>&1)
   if [ $? -ne 0 ]; then
     bad "describe-alarms failed:"
     echo "$ALARMS_JSON"
@@ -164,13 +175,13 @@ else
       echo "     $AnomalyAlarmName StateValue: $ASTATE"
     fi
 
-    LA=$(printf '%s' "$ALARMS_JSON" | jq -c --arg n "$LoadAlarmName" '[.MetricAlarms[] | select(.AlarmName==$n)][0]')
+    LA=$(printf '%s' "$ALARMS_JSON" | jq -c --arg n "$ErrorRateAlarmName" '[.MetricAlarms[] | select(.AlarmName==$n)][0]')
     if [ "$LA" = "null" ] || [ -z "$LA" ]; then
-      bad "load alarm '$LoadAlarmName' not found"
+      bad "error-rate alarm '$ErrorRateAlarmName' not found"
     else
       LSTATE=$(printf '%s' "$LA" | jq -r '.StateValue')
       ok "load alarm present"
-      echo "     $LoadAlarmName StateValue: $LSTATE"
+      echo "     $ErrorRateAlarmName StateValue: $LSTATE"
     fi
   fi
 fi
@@ -183,16 +194,17 @@ if [ "$STACK_DEPLOYED" != 1 ]; then
   skip "anomaly band — stack not deployed"
 else
   # We query ANOMALY_DETECTION_BAND(m1, 2) directly with get-metric-data
-  # rather than reading culprit-Latency-Anomaly's StateValue. That alarm's
+  # rather than reading culprit-App-Anomaly's StateValue. That alarm's
   # state depends on when it last happened to evaluate and sits in
   # INSUFFICIENT_DATA until then even after the band exists; a direct
   # get-metric-data call is deterministic — it either returns band values
   # right now or it doesn't, with no evaluation-timing race.
   END=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   START=$(date -u -d '-15 minutes' +%Y-%m-%dT%H:%M:%SZ)
-  BQ=$(jq -n --arg ns "$NAMESPACE" '[
-    {Id: "m1", MetricStat: {Metric: {Namespace: $ns, MetricName: "RequestLatency"}, Period: 60, Stat: "Average"}, ReturnData: false},
-    {Id: "ad1", Expression: "ANOMALY_DETECTION_BAND(m1, 2)", ReturnData: true}
+  BQ=$(jq -n --arg ns "$NAMESPACE" --arg dn "$DIM_NAME" --arg dv "$DIM_VALUE" --arg k "$SENSITIVITY" '[
+    {Id: "m1", MetricStat: {Metric: {Namespace: $ns, MetricName: "RequestLatency",
+      Dimensions: [{Name: $dn, Value: $dv}]}, Period: 60, Stat: "Average"}, ReturnData: false},
+    {Id: "ad1", Expression: ("ANOMALY_DETECTION_BAND(m1, " + $k + ")"), ReturnData: true}
   ]')
   BAND=$(aws cloudwatch get-metric-data --region "$REGION" --start-time "$START" --end-time "$END" \
           --metric-data-queries "$BQ" --output json 2>&1)
@@ -274,14 +286,14 @@ fi
 
 # ---------------------------------------------------------------------------
 echo
-echo "7. THE END-TO-END WIRE TEST (synthetic alarm trip)"
+echo "7. THE END-TO-END WIRE TEST (forced alarm trip)"
 WIRE_RESULT="skipped"
 if [ "$STACK_DEPLOYED" != 1 ]; then
   skip "wire test — stack not deployed"
 else
   TRIP_EPOCH_MS=$(( $(date -u +%s) * 1000 - 5000 ))  # 5s buffer for clock skew
   SET_OUT=$(aws cloudwatch set-alarm-state --region "$REGION" --alarm-name "$StaticAlarmName" \
-    --state-value ALARM --state-reason "verify_chain.sh synthetic trip" 2>&1)
+    --state-value ALARM --state-reason "verify_chain.sh forced trip" 2>&1)
   if [ $? -ne 0 ]; then
     bad "set-alarm-state ALARM failed:"
     echo "$SET_OUT"

@@ -34,14 +34,24 @@
 > 3. **The demo script in §9 is aspirational** (git push → auto-deploy →
 >    regression). The rehearsed, timed, actually-working run is
 >    `docs/runbook.md`. Run that one.
+> 4. **There is no synthetic feed.** Every mention below of namespace
+>    `Culprit` as a *metric source*, of `scripts/seed_metrics.py`, of
+>    `culprit-Latency-High` / `culprit-Latency-Anomaly` / `culprit-Load-High`,
+>    or of "two feeds", is historical. All of it was deleted on 2026-08-22 —
+>    two of those alarms could dispatch, so the agent could have been handed a
+>    fabricated regression. `decisions.md` §9. Live now: `HackathonDemo`
+>    (`RequestLatency`, `ErrorRate`) + `HackathonDemo/System`, alarmed by
+>    `culprit-App-High`, `culprit-App-Anomaly`, `culprit-App-ErrorRate`.
+>    `Culprit` survives only as the *stack* and *dashboard* name.
 >
 > Everything else — the EventBridge → Lambda → `repository_dispatch` spine, the
 > anomaly-band reasoning, the interface contracts — is current.
 > ---
 
 > **Naming:** the project was briefly called "PromptOps" during design. It is
-> now **Culprit** — the agent's job is to name the guilty commit. The
-> CloudWatch namespace is `Culprit`. If the team prefers another name, change
+> now **Culprit** — the agent's job is to name the guilty commit. It names the
+> CloudFormation stack and the dashboard; the metric namespace is the app's own
+> `HackathonDemo`. If the team prefers another name, change
 > it once, here and in `template.yaml`, before anyone starts building.
 
 ---
@@ -160,14 +170,12 @@ Start at `CORPUS_SIZE = 4000` (~8M comparisons after the regression) and
 ├─ namespace "HackathonDemo/System" (CloudWatch agent on the box) ──────┤
 │  cpu_usage_active · mem_used_percent · disk_used_percent          ◀ DASHBOARD
 └───────────────────────────────────┬───────────────────────────────────┘
-                                    │   both feeds emit onto the SAME bus and
-                                    │   are served by the SAME Lambda ↓
-┌─ CloudWatch · namespace "Culprit" — synthetic feed, 10s, kept on ─────┐
-│  RequestLatency ──┬─→ culprit-Latency-High     static, Period 10  ◀ TRIGGER
-│  (MILLISECONDS)   └─→ culprit-Latency-Anomaly  ML band, Period 60 ◀ TRIGGER
-│  SystemLoad1 ───────→ culprit-Load-High        corroboration only ◀ EVIDENCE
-│  WorkUnits        ← stays flat. this is the discriminator.        ◀ EVIDENCE
-│  RequestCount                                                     ◀ EVIDENCE
+                                    │   everything emits onto the SAME bus and
+                                    │   is served by the SAME Lambda ↓
+│                                                                       │
+│  [ a second namespace "Culprit" — a synthetic publisher with its own   │
+│    static, band and load alarms — used to sit here. Deleted; two of    │
+│    its alarms were dispatch-eligible. decisions.md §9. ]               │
 └───────────────────────────────────┬───────────────────────────────────┘
                                     │  EventBridge default bus
                                     │  "CloudWatch Alarm State Change"
@@ -229,35 +237,34 @@ alarm fires.
 
 ---
 
-## 3. Detection: two feeds, two kinds of alarm
+## 3. Detection: one feed, two kinds of alarm
 
-Two metric feeds are live: the original synthetic publisher (namespace
-`Culprit`) and, since W1's app landed on EC2, the real app itself (namespace
-`HackathonDemo`). Each feed carries a static alarm and an ML anomaly-band
-alarm — four alarms, and all four dispatch to EventBridge — plus one
-corroboration-only alarm each (`culprit-Load-High` on `Culprit`,
-`culprit-App-ErrorRate` on `HackathonDemo`) that does not. Six alarms total.
-The pair documented in detail below is the `Culprit` feed; `culprit-App-High`
-and `culprit-App-Anomaly` on `HackathonDemo` follow the same static/band
-split against the app's own `RequestLatency` (seconds, not milliseconds —
-see I1) and its `App=bad-app-ec2` dimension.
+**Historical note:** this section was written when two feeds were live — the
+synthetic publisher on namespace `Culprit` and the real app on `HackathonDemo`
+— with a static alarm and an ML anomaly-band alarm on each. The synthetic side
+is gone (`decisions.md` §9). Three alarms remain, all on the real app:
+`culprit-App-High` (static trigger), `culprit-App-Anomaly` (band, trigger) and
+`culprit-App-ErrorRate` (corroboration only, does not dispatch). The
+static/band reasoning below is unchanged and is what those alarms implement;
+only the namespace, unit and period differ.
 
-### `culprit-Latency-High` — the trigger (static)
+### `culprit-App-High` — the trigger (static)
 
 ```yaml
-Namespace: Culprit
+Namespace: HackathonDemo
 MetricName: RequestLatency
+Dimensions: [{Name: App, Value: bad-app-ec2}]   # omit these and it matches nothing
 Statistic: Average
-Period: 10                 # high-resolution; requires StorageResolution=1 on the metric
-EvaluationPeriods: 2
-DatapointsToAlarm: 2
-Threshold: !Ref LatencyThresholdMs      # from scripts/calibrate.sh — never guessed
+Period: 60                 # standard resolution; the app publishes every 10s into 60s bins
+EvaluationPeriods: 1
+DatapointsToAlarm: 1       # a 20x jump is never noise; a confirming period buys nothing
+Threshold: !Ref AppLatencyThresholdSeconds   # SECONDS. 0.5. scripts/calibrate.sh confirms it
 ComparisonOperator: GreaterThanThreshold
 TreatMissingData: ignore   # NOT notBreaching — see below
 ```
 
-Fires ~30–50 s after the bad code goes live (measured: 45 s). This is the one
-that starts the pipeline.
+Fires ~60–90 s after the bad code goes live (measured across two rehearsals:
+1m41s and 2m53s). This is the one that starts the pipeline.
 
 `TreatMissingData: ignore` is load-bearing and was `notBreaching` first. The
 publisher emits every ~10 s into a 10 s period, so period boundaries routinely
@@ -339,9 +346,12 @@ you it is broken**. The deployed anomaly alarm therefore uses
 `TreatMissingData: missing`, which leaves the untrained state visible instead
 of disguising it as health.
 
-Mitigation: the publisher runs **all night** (`make metrics`, 10 s interval).
-That is what makes the band real by morning. Do not stop it — killing it resets
-training, and the 3-hour clock starts over.
+Mitigation: the app runs continuously and publishes its own metrics every 10 s,
+so the band trains as long as the box is up. Do not stop the app to "save the
+box" between rehearsals — killing it resets training and the clock starts over.
+As of 2026-08-22 the detector still reports `TRAINED_INSUFFICIENT_DATA`;
+CloudWatch wants days and has hours, which is exactly why the band is 8 stdev
+wide rather than 2 (`decisions.md` §8).
 
 The second thing that will bite you is a **latched** alarm. `verify_chain.sh`
 forces ALARM by hand to test the wiring; a latched alarm emits no further
@@ -376,13 +386,18 @@ explicitly. All `Culprit` metrics are published at `StorageResolution: 1`.
 | `WorkUnits` | `Count` | **discriminator** | **flat** |
 | `RequestCount` | `Count` | rules out traffic growth | **flat** |
 
-This is the contract `scripts/seed_metrics.py` fulfills, and it is still
-live (§3, §5). W1's app landed with a second, independent metric set that
-does not conform to it: namespace `HackathonDemo`, `RequestLatency` in
-**seconds** (not milliseconds), plus `ErrorRate`, both dimensioned
-`App=bad-app-ec2`. It has no `WorkUnits`/`RequestCount` equivalent, which is
-part of why the `Culprit` feed above was kept running rather than retired —
-see §5.
+**The table above is historical.** It described `scripts/seed_metrics.py`,
+deleted 2026-08-22 (`decisions.md` §9). The live contract is W1's app:
+namespace `HackathonDemo`, `RequestLatency` in **seconds** (~0.05 healthy,
+~1.1 regressed) plus `ErrorRate`, both dimensioned `App=bad-app-ec2`, at
+standard resolution; and `HackathonDemo/System` from the CloudWatch agent
+(`cpu_usage_active`, `mem_used_percent`, `disk_used_percent`). There is no
+`WorkUnits`/`RequestCount` equivalent — the discriminator role is now played
+by **CPU rising while memory, disk and errors stay flat**, which is the shape
+the Lambda's evidence block actually carries (`runbook.md`). The interface
+below still holds: the Lambda reads namespace, unit and period off the event
+rather than hardcoding them, which is why deleting an entire feed cost zero
+Lambda changes.
 
 ### I2 — Dispatch payload · W2 → W3
 
@@ -484,30 +499,31 @@ same file in the same hour.
 | | Workstream | Owns these paths, exclusively | Blocked by |
 |---|---|---|---|
 | **W1** | The app & the box | `app/`, EC2, systemd units, instance profile | nothing |
-| **W2** | Detection & dispatch — **BUILT, both feeds live** | `infra/detection.yaml`, `scripts/{seed_metrics.py,calibrate.sh,deploy_detection.sh,verify_chain.sh}`, `.github/workflows/dispatch-receipt.yml`, `docs/w2-detection.md` | **nothing** — see below |
+| **W2** | Detection & dispatch — **BUILT against the real app** | `infra/detection.yaml`, `scripts/{calibrate.sh,deploy_detection.sh,verify_chain.sh}`, `.github/workflows/dispatch-receipt.yml`, `docs/w2-detection.md` | **nothing** — see below |
 | **W3** | The agent | `.github/`, `scripts/gather_evidence.sh`, `scripts/test_dispatch.sh` | nothing |
-| **W4** | The incident & the demo | `scripts/seed_incident.sh`, the runbook, rehearsals | W1 |
+| **W4** | The incident & the demo | the culprit commit, the runbook, rehearsals | W1 |
 
 W2 turned out **not** to be blocked by W1. CloudWatch cannot tell whether a
 datapoint came from a Flask app on EC2 or from a script on a laptop, so with I1
-frozen, `scripts/seed_metrics.py` stood in for W1's app and the whole chain
-was built and proven against real CloudWatch before the app existed. W1's app
-has since landed and is alarmed (`culprit-App-High`, `culprit-App-Anomaly`,
-`culprit-App-ErrorRate` on namespace `HackathonDemo`), but the synthetic feed
-was not retired — it stayed on deliberately. It runs at 10 s resolution
-against the app's 60 s, it already carries hours of anomaly-band training the
-app's feed does not have, and it publishes `WorkUnits`/`RequestCount`, the
-two discriminator metrics the real app does not emit. Both feeds are now
-permanent, not sequential. Anyone else blocked on a teammate should check
-whether their upstream is really a dependency or just a data source they can
-stand in for.
+frozen, a throwaway publisher stood in for W1's app and the whole chain was
+built and proven against real CloudWatch before the app existed. That is the
+transferable lesson: anyone blocked on a teammate should check whether their
+upstream is really a dependency or just a data source they can stand in for.
 
-The one remaining gap: `culprit-App-Anomaly` sits in `INSUFFICIENT_DATA`
-until roughly 17:00Z. An anomaly band needs about 3 hours of history to
-train and the instance booted at 13:53Z. It is deliberately not backfilled —
-writing synthetic points into a teammate's real metric stream would corrupt
-the baseline the band is meant to learn, which is worse than a few hours of
-`INSUFFICIENT_DATA`.
+The stand-in was then **deleted** once the app landed (`decisions.md` §9). It
+had been kept on as a "fallback feed", which was a mistake — two of its three
+alarms were wired into dispatch, so a fabricated regression could have been
+handed to the agent as if it were real. Everything W2 watches now comes from
+the app: `culprit-App-High`, `culprit-App-Anomaly` and `culprit-App-ErrorRate`
+on namespace `HackathonDemo`.
+
+The one remaining gap: `culprit-App-Anomaly`'s detector still reports
+`TRAINED_INSUFFICIENT_DATA` — CloudWatch wants days of history and has hours.
+It is deliberately **not** backfilled: writing synthetic points into the app's
+real metric stream would corrupt the baseline the band exists to learn. The
+band is widened to 8 stdev instead (`decisions.md` §8), which is the honest
+way to handle a young model. The static alarm is the trigger that matters;
+the band is the one that gets the "and it is ML" line on stage.
 
 W2 also deploys a **separate stack** (`infra/detection.yaml` → `culprit-detection`)
 rather than editing `template.yaml`. Same reason, stated as a rule: single

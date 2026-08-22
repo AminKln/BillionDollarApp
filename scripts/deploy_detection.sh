@@ -5,8 +5,8 @@
 # another workstream; this one is additive so the two can be deployed, broken
 # and rolled back independently. Nothing here touches it.
 #
-#   ./scripts/deploy_detection.sh                 # threshold from .run/threshold
-#   LATENCY_THRESHOLD_MS=95 ./scripts/deploy_detection.sh
+#   ./scripts/deploy_detection.sh
+#   APP_LATENCY_THRESHOLD_SECONDS=0.5 ./scripts/deploy_detection.sh
 #   GITHUB_TOKEN=ghp_xxx ./scripts/deploy_detection.sh
 #   ALERT_EMAIL=you@example.com ./scripts/deploy_detection.sh
 #
@@ -18,8 +18,16 @@ cd "$(dirname "$0")/.."
 
 STACK=${STACK:-culprit-detection}
 REGION=${REGION:-us-east-1}
-NAMESPACE=${NAMESPACE:-Culprit}
-SENSITIVITY=${LATENCY_SENSITIVITY:-2}
+NAMESPACE=${APP_NAMESPACE:-HackathonDemo}
+SYSTEM_NAMESPACE=${APP_SYSTEM_NAMESPACE:-HackathonDemo/System}
+DIM_NAME=${APP_DIMENSION_NAME:-App}
+DIM_VALUE=${APP_DIMENSION_VALUE:-bad-app-ec2}
+# 8, not 2. This default USED to be 2 and it silently overrode the template's
+# own default on every deploy -- including the deploy that was supposed to fix
+# the false positives. At 2 the anomaly band top sits at 0.052s, below live
+# healthy traffic (0.051-0.054s), and culprit-App-Anomaly flaps permanently.
+# See infra/detection.yaml's LatencySensitivity and docs/decisions.md 8.
+SENSITIVITY=${LATENCY_SENSITIVITY:-8}
 EVENT_TYPE=${DISPATCH_EVENT_TYPE:-anomaly}
 ALERT_EMAIL=${ALERT_EMAIL:-}
 GITHUB_TOKEN=${GITHUB_TOKEN:-}
@@ -31,32 +39,32 @@ warn(){ echo "  ${YEL}warn${RST} $*"; }
 
 [ -f infra/detection.yaml ] || { bad "infra/detection.yaml not found"; exit 1; }
 
-# --- owner/repo from the git remote, never hardcoded -----------------------
-ORIGIN=$(git config --get remote.origin.url 2>/dev/null || echo "")
-SLUG=$(printf '%s' "$ORIGIN" | sed -E 's#^.*github\.com[:/]##; s#\.git$##')
-OWNER=${GITHUB_OWNER:-${SLUG%%/*}}
-REPO=${GITHUB_REPO:-${SLUG##*/}}
-[ -n "$OWNER" ] && [ -n "$REPO" ] || { bad "could not derive owner/repo from '$ORIGIN'"; exit 1; }
+# --- dispatch target -------------------------------------------------------
+# NOT this repo. The repository_dispatch has to land where the culprit commit
+# and the responding workflow live, which is the bad app's own repo -- that is
+# what lets the workflow's built-in secrets.GITHUB_TOKEN open the PR with no
+# cross-repo PAT. This used to derive owner/repo from THIS repo's git remote,
+# which pointed every dispatch at BillionDollarApp, where there is no workflow
+# to receive it. See docs/plan.md 0.
+OWNER=${GITHUB_OWNER:-Tehreem404}
+REPO=${GITHUB_REPO:-bad_app_demo}
 
-# --- threshold: calibrated, or explicit, but never silently guessed --------
-if [ -n "${LATENCY_THRESHOLD_MS:-}" ]; then
-  THRESHOLD=$LATENCY_THRESHOLD_MS
-  SRC="LATENCY_THRESHOLD_MS env var"
-elif [ -s .run/threshold ]; then
-  THRESHOLD=$(cat .run/threshold)
-  SRC=".run/threshold (from scripts/calibrate.sh)"
+# --- threshold -------------------------------------------------------------
+# SECONDS, not milliseconds: the app publishes RequestLatency with
+# Unit=Seconds. Healthy is ~0.05s and the quadratic regression is ~1.1-2.1s,
+# so 0.5 sits an order of magnitude clear of both. ./scripts/calibrate.sh
+# re-derives it from live data and prints the override to paste here.
+if [ -n "${APP_LATENCY_THRESHOLD_SECONDS:-}" ]; then
+  THRESHOLD=$APP_LATENCY_THRESHOLD_SECONDS
+  SRC="APP_LATENCY_THRESHOLD_SECONDS env var"
 else
-  warn "no calibration found — running scripts/calibrate.sh now"
-  if [ -x scripts/calibrate.sh ] && scripts/calibrate.sh >/dev/null 2>&1 && [ -s .run/threshold ]; then
-    THRESHOLD=$(cat .run/threshold); SRC="scripts/calibrate.sh (just run)"
-  else
-    THRESHOLD=120; SRC="${YEL}fallback default — CALIBRATE BEFORE THE DEMO${RST}"
-  fi
+  THRESHOLD=0.5
+  SRC="default — run ./scripts/calibrate.sh to confirm against live data"
 fi
 
 echo "deploying ${STACK} to ${REGION}"
-echo "  namespace   $NAMESPACE"
-echo "  threshold   ${THRESHOLD}ms   ${DIM}<- ${SRC}${RST}"
+echo "  namespace   $NAMESPACE  ($DIM_NAME=$DIM_VALUE) + $SYSTEM_NAMESPACE"
+echo "  threshold   ${THRESHOLD}s   ${DIM}<- ${SRC}${RST}"
 echo "  sensitivity $SENSITIVITY"
 echo "  dispatch    ${OWNER}/${REPO}  event_type=${EVENT_TYPE}"
 if [ -n "$GITHUB_TOKEN" ]; then echo "  token       ${GRN}set${RST} (${#GITHUB_TOKEN} chars)";
@@ -67,8 +75,11 @@ echo
 # Parameters are passed on the command line, never written to a checked-in
 # file, so the PAT never lands in git. CFN stores it NoEcho.
 PARAMS=(
-  "MetricNamespace=$NAMESPACE"
-  "LatencyThresholdMs=$THRESHOLD"
+  "AppNamespace=$NAMESPACE"
+  "AppSystemNamespace=$SYSTEM_NAMESPACE"
+  "AppDimensionName=$DIM_NAME"
+  "AppDimensionValue=$DIM_VALUE"
+  "AppLatencyThresholdSeconds=$THRESHOLD"
   "LatencySensitivity=$SENSITIVITY"
   "GithubOwner=$OWNER"
   "GithubRepo=$REPO"

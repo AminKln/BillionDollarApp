@@ -30,7 +30,7 @@
       "items": { "type": "string" }
     },
     "metrics_flat": {
-      "description": "The discriminator. WorkUnits and RequestCount staying flat is what rules out load and input growth.",
+      "description": "The discriminator. CPU rising while memory, disk and error rate stay flat is what rules out a leak, a full disk, and a broken dependency -- leaving \"the same request now burns CPU it did not burn before\", which is a code change. Names here are metric names, not the fully-qualified SEARCH labels the dispatch payload uses as evidence keys.",
       "type": "array",
       "items": { "type": "string" }
     },
@@ -46,8 +46,8 @@
       "url": "https://github.com/AminKln/BillionDollarApp/pull/42",
       "suspect_sha": "a1b2c3d",
       "confidence": 0.9,
-      "metrics_that_moved": ["RequestLatency", "SystemLoad1"],
-      "metrics_flat": ["WorkUnits", "RequestCount"],
+      "metrics_that_moved": ["RequestLatency", "cpu_usage_active"],
+      "metrics_flat": ["ErrorRate", "mem_used_percent", "disk_used_percent"],
       "ruled_out": [
         "e4f5g6h refactor: extract the scoring loop into a helper — same file and hot path, but moves code without changing complexity",
         "b7c8d9e chore: bump flask to 3.1.2 — dependency only, not in the request path",
@@ -58,8 +58,8 @@
       "action": "issue",
       "url": "https://github.com/AminKln/BillionDollarApp/issues/17",
       "confidence": 0.4,
-      "metrics_that_moved": ["RequestLatency", "SystemLoad1"],
-      "metrics_flat": ["WorkUnits", "RequestCount"],
+      "metrics_that_moved": ["RequestLatency", "cpu_usage_active"],
+      "metrics_flat": ["ErrorRate", "mem_used_percent", "disk_used_percent"],
       "ruled_out": ["no commits touched the request path in the alarm window"]
     }
   ]

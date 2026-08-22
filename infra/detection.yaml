@@ -2,16 +2,23 @@
 # Culprit — detection + dispatch (plain CloudFormation, not SAM).
 #
 # What this stack is: the half of the Culprit pipeline between "CloudWatch
-# has the metrics" and "a Claude agent workflow is running." RequestLatency,
-# SystemLoad1, WorkUnits and RequestCount already arrive in namespace
-# Culprit via scripts/seed_metrics.py (or, later, the real Flask app) —
-# see docs/architecture.md §4 I1 for that contract. This template adds: a
-# static high-resolution alarm that fires the demo, a CloudWatch-native
-# anomaly-detection band for corroboration, a load alarm for corroboration,
-# an EventBridge rule that catches the static alarm's ALARM transition, a
-# stdlib-only Lambda that reshapes the event into a repository_dispatch
-# call (docs/contracts/dispatch-payload.json is the frozen shape), and a
-# dashboard.
+# has the metrics" and "a Claude agent workflow is running."
+#
+# EVERY metric this stack watches comes from the real Flask app on
+# i-091814f7a41456cb0 (Tehreem404/bad_app_demo). RequestLatency and ErrorRate
+# are published by the app's own put_metric_data under namespace HackathonDemo
+# with App=bad-app-ec2; cpu/mem/disk come from the CloudWatch agent on the box
+# under HackathonDemo/System. There is no synthetic feed. An earlier version of
+# this stack carried one (scripts/seed_metrics.py, namespace Culprit,
+# random.lognormvariate) and three alarms on top of it, two of which were wired
+# into dispatch -- meaning the agent could have been handed a regression that
+# never happened. All of it was removed on 2026-08-22; see decisions.md 9.
+#
+# This template adds: a static alarm that fires the demo, a CloudWatch-native
+# anomaly-detection band for corroboration, an error-rate alarm, an EventBridge
+# rule that catches their ALARM transitions, a stdlib-only Lambda that reshapes
+# the event into a repository_dispatch call
+# (docs/contracts/dispatch-payload.json is the frozen shape), and a dashboard.
 #
 # Deploy (no build step, no S3 bucket, no Docker):
 #
@@ -20,7 +27,7 @@
 #     --stack-name culprit-detection \
 #     --capabilities CAPABILITY_IAM \
 #     --parameter-overrides \
-#         LatencyThresholdMs=<from scripts/calibrate.sh> \
+#         AppLatencyThresholdSeconds=<from scripts/calibrate.sh> \
 #         GithubToken=$GITHUB_TOKEN \
 #         AlertEmail=you@example.com
 #
@@ -33,10 +40,8 @@
 # Two non-obvious AWS constraints baked into the resources below:
 #
 #   1. CloudWatch anomaly-detection alarms reject high-resolution periods.
-#      LatencyAnomalyAlarm's Period MUST be 60, even though the metric
-#      itself is published at StorageResolution 1 and the static alarm
-#      next to it happily uses Period 10. A 10 here fails at deploy, not
-#      at runtime.
+#      AppLatencyAnomalyAlarm's Period MUST be 60. A 10 here fails at
+#      deploy, not at runtime.
 #
 #   2. ANOMALY_DETECTION_BAND needs 3+ hours of data (AWS recommends 3
 #      days) before it produces a band at all. Until then the alarm sits
@@ -51,17 +56,6 @@ Description: >-
   RequestLatency, EventBridge -> Lambda -> GitHub repository_dispatch.
 
 Parameters:
-  MetricNamespace:
-    Type: String
-    Default: Culprit
-    Description: Namespace scripts/seed_metrics.py (or the real app) publishes into.
-
-  LatencyThresholdMs:
-    Type: Number
-    Default: 120
-    Description: >
-      Static RequestLatency threshold in ms. Normally supplied by
-      scripts/calibrate.sh from a real baseline measurement, not guessed.
 
   AppNamespace:
     Type: String
@@ -138,35 +132,6 @@ Resources:
   # The demo trigger. High-resolution (Period 10) is legal here because this
   # is a plain threshold alarm, not an anomaly-detection one — see the
   # AnomalyAlarm below for the constraint that forbids it there.
-  LatencyHighAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: culprit-Latency-High
-      AlarmDescription: RequestLatency over the calibrated static threshold. Fires the pipeline.
-      ActionsEnabled: true
-      Namespace: !Ref MetricNamespace
-      MetricName: RequestLatency
-      Statistic: Average
-      Unit: Milliseconds
-      Period: 10
-      EvaluationPeriods: 2
-      DatapointsToAlarm: 2
-      Threshold: !Ref LatencyThresholdMs
-      ComparisonOperator: GreaterThanThreshold
-      # "ignore", not "notBreaching". The publisher emits every ~10s into a
-      # 10s period, so period boundaries routinely land between samples and
-      # that period has no datapoint. notBreaching scores those as healthy,
-      # which drops the alarm to OK mid-incident and re-fires it on the next
-      # sample -- measured: one regression produced THREE OK->ALARM
-      # transitions in 25s, so three EventBridge events, three dispatches,
-      # three PRs for one bug. "ignore" holds the current state across a gap,
-      # so one incident is one alarm is one dispatch. It also refuses to call
-      # a dead publisher healthy.
-      TreatMissingData: ignore
-      AlarmActions:
-        - !Ref AlertTopic
-      OKActions:
-        - !Ref AlertTopic
 
   # The second detector, and a real trigger: the EventBridge rule below
   # matches this alarm by name too, so an anomaly can dispatch on its own.
@@ -175,95 +140,12 @@ Resources:
   # under 127ms but is still far outside what this metric normally does.
   # Deduplication is the Lambda's job, not the rule's -- see note 3 below
   # ZipFile for how the -High/-Anomaly naming convention carries it.
-  LatencyAnomalyDetector:
-    Type: AWS::CloudWatch::AnomalyDetector
-    Properties:
-      Namespace: !Ref MetricNamespace
-      MetricName: RequestLatency
-      Stat: Average
 
-  LatencyAnomalyAlarm:
-    Type: AWS::CloudWatch::Alarm
-    DependsOn: LatencyAnomalyDetector
-    Properties:
-      AlarmName: culprit-Latency-Anomaly
-      AlarmDescription: RequestLatency outside its CloudWatch-modeled expected band.
-      ActionsEnabled: true
-      ComparisonOperator: GreaterThanUpperThreshold
-      # 3-of-3 for the same reason as culprit-App-Anomaly below: a 2-stdev
-      # band over a low-variance metric false-positives, and this alarm
-      # flapped OK->ALARM at 15:20Z with nothing wrong.
-      EvaluationPeriods: 3
-      DatapointsToAlarm: 3
-      ThresholdMetricId: ad1
-      # "missing", not "notBreaching": an untrained band (see constraint #2
-      # above) leaves this alarm in INSUFFICIENT_DATA for the first 3+
-      # hours. notBreaching would report OK the whole time and hide that
-      # the band isn't real yet; missing surfaces it honestly.
-      TreatMissingData: missing
-      Metrics:
-        - Id: m1
-          ReturnData: true
-          MetricStat:
-            Metric:
-              Namespace: !Ref MetricNamespace
-              MetricName: RequestLatency
-            # MUST be 60 — anomaly-detection alarms reject high-resolution
-            # (10/30s) periods at deploy time, even though the metric is
-            # published at StorageResolution 1. See constraint #1 above.
-            Period: 60
-            Stat: Average
-        - Id: ad1
-          ReturnData: true
-          Expression: !Sub "ANOMALY_DETECTION_BAND(m1, ${LatencySensitivity})"
-          Label: "RequestLatency (expected band)"
-      AlarmActions:
-        - !Ref AlertTopic
-      OKActions:
-        - !Ref AlertTopic
-
-  # Corroboration only — proves the box, not just the endpoint, is under
-  # load. Not wired to EventBridge or dispatch.
-  LoadHighAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: culprit-Load-High
-      AlarmDescription: SystemLoad1 corroborating the latency regression.
-      ActionsEnabled: true
-      Namespace: !Ref MetricNamespace
-      MetricName: SystemLoad1
-      Statistic: Average
-      Unit: "None"
-      # 10s/3-of-3 = 30s to fire, deliberately trailing the latency alarm's 20s.
-      # This is corroboration, so it should land just after the thing it
-      # corroborates, not before it. At the Period 60/2-of-2 this alarm used to
-      # carry it needed 120s -- during a 2min demo regression it went red 20s
-      # AFTER recovery, which reads as noise rather than evidence. The feed is
-      # high-resolution, so the 60s period was throwing away data we already pay
-      # for. Three consecutive points rather than two because SystemLoad1 is a
-      # 1-minute load average: already smoothed, so a genuine crossing sustains
-      # and only a spike needs filtering out.
-      Period: 10
-      EvaluationPeriods: 3
-      DatapointsToAlarm: 3
-      Threshold: 2.0
-      ComparisonOperator: GreaterThanThreshold
-      # Same reasoning as the latency alarm above: a gap in publishing is not
-      # evidence of health.
-      TreatMissingData: ignore
-
-  # ── The real EC2 app ────────────────────────────────────────────────────
+  # ── The real EC2 app — the only thing this stack watches ────────────────
   #
-  # Everything above watches scripts/seed_metrics.py, which publishes a
-  # dimensionless high-resolution feed we control. The pair below watches the
-  # actual Flask app on the demo EC2 box, which publishes RequestLatency and
-  # ErrorRate under App=bad-app-ec2 every 10s at standard resolution.
+  # The Flask app on the demo EC2 box publishes RequestLatency and ErrorRate
+  # under App=bad-app-ec2 every 10s at standard resolution. Two traps:
   #
-  # Three things differ from the synthetic feed and each one is a trap:
-  #
-  #   * Units. bad_app.py sends Unit=Seconds (healthy ~0.05); the synthetic
-  #     feed sends milliseconds (healthy ~40). A threshold copied across
-  #     would be off by 1000x and could never fire.
   #   * Dimensions. These metrics carry App=bad-app-ec2. An alarm that omits
   #     the dimension matches no metric at all and sits in INSUFFICIENT_DATA
   #     forever, looking healthy while watching nothing.
@@ -461,7 +343,7 @@ Resources:
         #    EventBridge Input Transformer -- a transformer has no JSON decode and
         #    cannot reach inside it to get the datapoints.
         #
-        # 2. evidence() re-reads SystemLoad1, WorkUnits and RequestCount at alarm
+        # 2. evidence() re-reads every metric in the app's namespaces at alarm
         #    time and reports each as flat or changed. That is the discriminator:
         #    latency and load rise while work and traffic stay flat, so the same
         #    work on the same traffic now costs more -- which is a code change, not
@@ -474,7 +356,7 @@ Resources:
         #    starts, so at dispatch time the regression is only ~3 datapoints old.
         #    An earlier version read Period 60 and compared the last two minutes
         #    against the previous eighteen; the "last two minutes" were still
-        #    entirely pre-regression, so it reported SystemLoad1 *falling* 23%
+        #    entirely pre-regression, so it reported host load *falling* 23%
         #    during an incident that tripled it. Period 10 (the metrics are
         #    high-resolution, so 10s buckets are real) with now = the last 3
         #    buckets and before = everything older than 5 minutes fixes it. The
@@ -648,12 +530,9 @@ Resources:
           # Ref on AWS::CloudWatch::Alarm returns the alarm NAME, so this
           # stays correct even if AlarmName above ever changes.
           alarmName:
-            # REAL APP ONLY. The two culprit-Latency-* alarms watch the
-            # `Culprit` namespace, which is scripts/seed_metrics.py making up
-            # numbers with random.lognormvariate -- no app, no HTTP, no work.
-            # They stay deployed as a dashboard fallback if the shared EC2 box
-            # dies, but they must never reach the agent: a PR written about
-            # fabricated latency is worse than no PR. See decisions.md 4 and 8.
+            # All three are on the real app. The synthetic-feed alarms that
+            # used to sit in this list were deleted outright -- a PR written
+            # about fabricated latency is worse than no PR. See decisions.md 9.
             - !Ref AppLatencyHighAlarm
             - !Ref AppLatencyAnomalyAlarm
             - !Ref AppErrorRateAlarm
@@ -753,46 +632,6 @@ Resources:
                   [ { "expression": "SEARCH('Namespace=\"${AppSystemNamespace}\" MetricName=\"disk_used_percent\"', 'Average', 60)", "id": "dsk" } ]
                 ]
               }
-            },
-            {
-              "type": "metric", "x": 12, "y": 9, "width": 12, "height": 6,
-              "properties": {
-                "title": "Synthetic feed \u2014 RequestLatency vs expected band (ms)",
-                "region": "${AWS::Region}",
-                "period": 60,
-                "metrics": [
-                  [ { "expression": "ANOMALY_DETECTION_BAND(s1, ${LatencySensitivity})", "label": "expected band", "id": "sad" } ],
-                  [ "${MetricNamespace}", "RequestLatency", { "id": "s1", "stat": "Average", "label": "RequestLatency" } ]
-                ],
-                "annotations": {
-                  "horizontal": [
-                    { "label": "Static threshold", "value": ${LatencyThresholdMs} }
-                  ]
-                }
-              }
-            },
-            {
-              "type": "metric", "x": 0, "y": 15, "width": 12, "height": 6,
-              "properties": {
-                "title": "Synthetic feed \u2014 SystemLoad1 (corroboration)",
-                "region": "${AWS::Region}",
-                "period": 60,
-                "metrics": [
-                  [ "${MetricNamespace}", "SystemLoad1", { "stat": "Average" } ]
-                ]
-              }
-            },
-            {
-              "type": "metric", "x": 12, "y": 15, "width": 12, "height": 6,
-              "properties": {
-                "title": "Synthetic feed \u2014 work & traffic (flat = not doing more, doing it worse)",
-                "region": "${AWS::Region}",
-                "period": 60,
-                "metrics": [
-                  [ "${MetricNamespace}", "WorkUnits", { "stat": "Average" } ],
-                  [ "${MetricNamespace}", "RequestCount", { "stat": "Average" } ]
-                ]
-              }
             }
           ]
         }
@@ -802,12 +641,7 @@ Outputs:
     Value: !Ref DispatchFunction
   DispatchLogGroupName:
     Value: !Ref DispatchLogGroup
-  StaticAlarmName:
-    Value: !Ref LatencyHighAlarm
-  AnomalyAlarmName:
-    Value: !Ref LatencyAnomalyAlarm
-  LoadAlarmName:
-    Value: !Ref LoadHighAlarm
+
   AppStaticAlarmName:
     Value: !Ref AppLatencyHighAlarm
   AppAnomalyAlarmName:

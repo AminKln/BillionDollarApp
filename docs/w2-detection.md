@@ -1,21 +1,25 @@
 # W2 — detection & dispatch
 
-**Status: built, deployed, and watching the real EC2 app.** Everything from
-`put_metric_data` to `repository_dispatch` is real AWS infrastructure. W1's
-Flask app went live on `i-091814f7a41456cb0` mid-build, so W2 now runs against
-two feeds at once: the real app, and the synthetic publisher that was built to
-stand in for it.
+**Status: built, deployed, and watching the real EC2 app — and nothing else.**
+Everything from `put_metric_data` to `repository_dispatch` is real AWS
+infrastructure.
 
-Both are kept. The synthetic feed is not vestigial — it publishes at 10-second
-resolution (the real app is standard 60s), it carries the two discriminator
-metrics the real app does not yet emit, and its anomaly band has hours of
-training behind it while the real app's band is still filling. It is the fast,
-fully-instrumented rehearsal; the real app is the thing being demoed. Losing
-either would cost something specific.
+> **Read this before the rest of the file.** W2 was built against a synthetic
+> publisher (`scripts/seed_metrics.py`, namespace `Culprit`) while W1's app was
+> still being written. That publisher, its three alarms, its anomaly detector
+> and its dashboard widgets were **deleted on 2026-08-22** — two of those alarms
+> were dispatch-eligible, meaning the agent could have been handed a regression
+> that never happened (`decisions.md` §9). Sections below that describe "two
+> feeds", `make metrics` / `make regress` / `make recover`, `culprit-Latency-*`
+> alarms, or `WorkUnits` / `RequestCount` are **historical**. They are kept
+> because the two-feeds design is *why* the Lambda reads namespace, unit and
+> period off the event instead of hardcoding them — which is what made deleting
+> half the inputs a zero-line change. The live surface is: namespace
+> `HackathonDemo` (`RequestLatency`, `ErrorRate`, dimension `App=bad-app-ec2`)
+> plus `HackathonDemo/System`, and alarms `culprit-App-High`,
+> `culprit-App-Anomaly`, `culprit-App-ErrorRate`.
 
 The plan this implements is [`architecture.md`](architecture.md) §3 and §4.
-This file is the operational record: what exists, what is faked, what swaps in
-when the other workstreams land.
 
 ---
 
@@ -314,7 +318,6 @@ leave the shading and the panel beside it turn red, in that order, is the demo.
 ## Runbook
 
 ```bash
-make metrics        # start the rehearsal feed. leave it running — the band trains.
 make calibrate      # derive the threshold from observed data. never guess it.
 make deploy         # alarms, anomaly detectors, EventBridge, Lambda, dashboard
 make verify         # prove the chain end to end
@@ -323,7 +326,7 @@ make verify         # prove the chain end to end
 `make verify` is the important one. It forces the alarm with
 
 ```bash
-aws cloudwatch set-alarm-state --alarm-name culprit-Latency-High --state-value ALARM
+aws cloudwatch set-alarm-state --alarm-name culprit-App-High --state-value ALARM
 ```
 
 then watches the Lambda's log group. This separates two failures that look
@@ -349,17 +352,10 @@ sleep — a 45x jump. That is why `culprit-App-High` is 1-of-1 rather than 2-of-
 a jump that size is never noise, so a second confirming period would buy no
 accuracy and cost a minute of demo silence.
 
-To demo against the **synthetic feed** (faster, and works with no EC2 box):
-
-```bash
-make regress        # latency 40ms -> 250ms, load 0.8 -> 2.6, work/traffic unchanged
-make alarms         # watch culprit-Latency-High go to ALARM (~20-60s)
-make logs           # watch the dispatch Lambda POST it
-make recover        # back to healthy, as if the revert landed
-```
-
-`make regress` toggles a flag file that the running publisher reads live, so the
-process is never restarted and the trained anomaly band is never lost.
+There is no second way to demo this any more, and that is deliberate. The
+synthetic feed was the fallback; it was also a second source of truth wired into
+dispatch. `make payload` — which reprints the exact JSON the Lambda last handed
+GitHub — is the fallback now, and it is an honest one.
 
 ---
 
