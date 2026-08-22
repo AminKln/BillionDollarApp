@@ -1,0 +1,12 @@
+{
+  "_contract": "review-result",
+  "_description": "Structured JSON the LLM (Bedrock) review step is asked to return. Stored in DynamoDB/S3 and used to build the Grafana annotation text and SNS/Slack notification.",
+  "segment_id": "demo-app#2026-08-21T14:32:00Z",
+  "suspect_commit_sha": "a1b2c3d",
+  "confidence": 0.87,
+  "explanation": "Commit a1b2c3d removed the retry cap in bad_app.py's downstream call handling, allowing unbounded retries under load. This aligns with the latency spike observed starting at 14:32Z.",
+  "suggested_action": "Re-add the retry cap / backoff limit removed in a1b2c3d and redeploy.",
+  "reviewed_commits": ["a1b2c3d"],
+  "model_id": "us.anthropic.claude-sonnet-5",
+  "generated_at": "2026-08-21T14:33:15Z"
+}

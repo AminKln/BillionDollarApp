@@ -1,0 +1,20 @@
+{
+  "_contract": "anomaly-context",
+  "_description": "Object assembled from the anomaly segment + git-context lookup, passed into the LLM review prompt. Produced by combining the DynamoDB segment record with the git_context Lambda's output.",
+  "segment_id": "demo-app#2026-08-21T14:32:00Z",
+  "service": "demo-app",
+  "repo": {
+    "owner": "team-06",
+    "name": "DevOps-for-Gen-AI---Ottawa-2026---Team-06"
+  },
+  "metric": "http_request_duration_seconds",
+  "threshold_breached": "avg_over_time[5m] > avg_over_time[1h] + 3*stddev_over_time[1h]",
+  "magnitude": 4.2,
+  "duration_seconds": 180,
+  "startsAt": "2026-08-21T14:32:00Z",
+  "endsAt": null,
+  "good_commit_sha": "e3f1a9c",
+  "head_commit_sha": "a1b2c3d",
+  "commit_count_since_good": 1,
+  "diff_truncated": false
+}
