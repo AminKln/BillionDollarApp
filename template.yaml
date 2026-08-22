@@ -1,0 +1,202 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Anomaly Detection -> LLM Code Review & Fix Agent (CloudWatch-native).
+  See docs/architecture.md for the full design. One Lambda handles both the
+  SNS-triggered review pipeline and the CloudWatch custom-widget render.
+
+Parameters:
+  GithubOwner:
+    Type: String
+    Description: GitHub org/user that owns the demo repo (lambda/git_context.py).
+  GithubRepo:
+    Type: String
+    Description: Demo repo name — the same repo this template lives in.
+  GithubToken:
+    Type: String
+    NoEcho: true
+    Description: >
+      GitHub PAT with repo read access. Pass via
+      `sam deploy --parameter-overrides GithubToken=$GITHUB_TOKEN` (sourced
+      from .env) — never commit a real value into samconfig.toml.
+  BedrockModelId:
+    Type: String
+    Default: anthropic.claude-3-5-sonnet-20241022-v2:0
+    Description: >
+      PLACEHOLDER — confirm against the model your Bedrock access request
+      actually grants (docs/architecture.md section 9, bottleneck #1) before
+      first real deploy.
+  NotifyEmail:
+    Type: String
+    Description: Email address subscribed to the human-facing verdict notifications.
+  LatencyAnomalySensitivity:
+    Type: Number
+    Default: 2
+    Description: Standard deviations for the ANOMALY_DETECTION_BAND width.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 60
+    MemorySize: 256
+
+Resources:
+  # ── SNS topics ──────────────────────────────────────────────────────────
+  # Two separate topics, deliberately: the alarm topic drives the Lambda,
+  # the notify topic is the human-facing email. Sharing one topic would make
+  # the Lambda's own notification re-invoke itself.
+  AnomalyAlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-anomaly-alarm"
+
+  AnomalyNotifyTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-anomaly-notify"
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotifyEmail
+
+  # ── Lambda ──────────────────────────────────────────────────────────────
+  ReviewFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-review"
+      CodeUri: lambda/
+      Handler: handler.lambda_handler
+      Environment:
+        Variables:
+          GITHUB_OWNER: !Ref GithubOwner
+          GITHUB_REPO: !Ref GithubRepo
+          GITHUB_TOKEN: !Ref GithubToken
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          NOTIFY_TOPIC_ARN: !Ref AnomalyNotifyTopic
+      Policies:
+        - Statement:
+            - Sid: InvokeBedrock
+              Effect: Allow
+              Action: bedrock:InvokeModel
+              Resource: "*"
+            - Sid: PublishNotifications
+              Effect: Allow
+              Action: sns:Publish
+              Resource: !Ref AnomalyNotifyTopic
+            - Sid: PersistLastVerdict
+              # Self-referencing: lets notify.py stash the latest verdict as
+              # this function's own env var instead of standing up
+              # DynamoDB/S3 for a single value (docs/architecture.md §7).
+              Effect: Allow
+              Action: lambda:UpdateFunctionConfiguration
+              Resource: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-review"
+      Events:
+        AlarmNotification:
+          Type: SNS
+          Properties:
+            Topic: !Ref AnomalyAlarmTopic
+
+  # CloudWatch dashboards invoke custom widgets directly (not via the SNS
+  # event above), so they need their own explicit invoke permission.
+  DashboardWidgetInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ReviewFunction
+      Action: lambda:InvokeFunction
+      Principal: cloudwatch.amazonaws.com
+
+  # ── Anomaly detection ───────────────────────────────────────────────────
+  RequestLatencyAnomalyDetector:
+    Type: AWS::CloudWatch::AnomalyDetector
+    Properties:
+      Namespace: HackathonDemo
+      MetricName: RequestLatency
+      Stat: Average
+
+  RequestLatencyAnomalyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: RequestLatencyAnomalyDetector
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-RequestLatency-Anomaly"
+      AlarmDescription: >
+        Fires when RequestLatency (namespace HackathonDemo) moves outside its
+        CloudWatch-modeled expected band. See docs/architecture.md §4.
+      ComparisonOperator: GreaterThanUpperThreshold
+      EvaluationPeriods: 2
+      ThresholdMetricId: ad1
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: m1
+          ReturnData: true
+          MetricStat:
+            Metric:
+              Namespace: HackathonDemo
+              MetricName: RequestLatency
+            Period: 60
+            Stat: Average
+        - Id: ad1
+          ReturnData: true
+          Expression: !Sub "ANOMALY_DETECTION_BAND(m1, ${LatencyAnomalySensitivity})"
+          Label: "RequestLatency (expected band)"
+      AlarmActions:
+        - !Ref AnomalyAlarmTopic
+      OKActions:
+        - !Ref AnomalyAlarmTopic
+
+  # ── Dashboard ───────────────────────────────────────────────────────────
+  AnomalyDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${AWS::StackName}-anomaly-dashboard"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "RequestLatency (with anomaly band)",
+                "region": "${AWS::Region}",
+                "metrics": [
+                  [ "HackathonDemo", "RequestLatency", { "id": "m1" } ],
+                  [ { "expression": "ANOMALY_DETECTION_BAND(m1, ${LatencyAnomalySensitivity})", "label": "Expected band", "id": "ad1" } ]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "ErrorRate / CPU / RAM / Disk",
+                "region": "${AWS::Region}",
+                "metrics": [
+                  [ "HackathonDemo", "ErrorRate" ],
+                  [ "HackathonDemo", "mem_used_percent" ],
+                  [ "HackathonDemo", "disk_used_percent" ]
+                ]
+              }
+            },
+            {
+              "type": "custom",
+              "x": 0, "y": 6, "width": 24, "height": 6,
+              "properties": {
+                "endpoint": "${ReviewFunction.Arn}",
+                "title": "Latest LLM verdict",
+                "updateOn": {
+                  "refresh": true,
+                  "resize": false,
+                  "timeRange": false
+                }
+              }
+            }
+          ]
+        }
+
+Outputs:
+  ReviewFunctionArn:
+    Value: !GetAtt ReviewFunction.Arn
+  AnomalyAlarmTopicArn:
+    Value: !Ref AnomalyAlarmTopic
+  AnomalyNotifyTopicArn:
+    Value: !Ref AnomalyNotifyTopic
+  DashboardUrl:
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AnomalyDashboard}"
