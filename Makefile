@@ -300,7 +300,14 @@ deploy:            ## deploy the detection stack (alarms + EventBridge + dispatc
 verify:            ## prove the whole chain end to end (forces a synthetic alarm)
 	@./scripts/verify_chain.sh
 
-logs:              ## tail the dispatch Lambda's logs
+payload:           ## show the last payload the Lambda built (DEMO FALLBACK - works on CLI v1)
+	@./scripts/last_payload.sh $(or $(N),1)
+
+logs:              ## tail the dispatch Lambda's logs (needs AWS CLI v2)
+	@aws logs tail --help >/dev/null 2>&1 || { \
+	  echo "'aws logs tail' needs AWS CLI v2; you are on:"; aws --version; \
+	  echo "run 'make setup-awscli', or use 'make payload' which works on v1."; \
+	  exit 1; }
 	@aws logs tail /aws/lambda/culprit-dispatch --follow --region $(REGION)
 
 alarms:            ## current state of every culprit- alarm, both feeds

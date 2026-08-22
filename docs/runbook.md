@@ -26,9 +26,16 @@ Open two browser tabs:
 | 0:40 | — | dashboard latency line lifts off the floor |
 | 1:00 | — | CPU climbs 2% → ~45% |
 | **2:30** | — | **`culprit-App-High` goes red** |
-| 2:35 | — | Actions tab: a run appears |
+| 2:35 | `make payload` | **the evidence the agent receives** — read it aloud |
+| 2:40 | — | Actions tab: a run appears |
 | 3:00 | — | the PR |
 | — | **`make app-recover`** | **never skip this. shared box.** |
+
+`make payload` is the one to rehearse. It prints the exact JSON the Lambda
+handed GitHub, formatted to be read off a projector — five metrics, before →
+now → change. It is the moment the demo stops being "an alarm went off" and
+starts being "here is the diagnosis." It also works with no `GITHUB_TOKEN` on
+the stack, which makes it the fallback below.
 
 Measured over two full rehearsals on the real box: chaos on 17:10 → ALARM
 **17:12:53** (2m53s), and chaos on 17:18:54 → ALARM **17:20:35** (1m41s). The
@@ -89,7 +96,8 @@ indistinguishable from a slow database. Same alarm, no diagnosis.
 |---|---|---|
 | `app-status` unreachable | instance stopped | `make app-status` re-resolves the IP by tag; if it still fails the box is down |
 | chaos flips but latency does not move | wrong parameter prefix | the app reads `CHAOS_PARAM_PREFIX`, default `/hackathon-demo/chaos` |
-| alarm red, no Actions run | no `GITHUB_TOKEN` on the stack | `GITHUB_TOKEN=xxx make deploy` |
+| alarm red, no Actions run | no `GITHUB_TOKEN` on the stack | `GITHUB_TOKEN=xxx make deploy`. **If there is no time: run `make payload` and demo it there.** The chain ran; it just stopped one HTTP POST short. |
+| `make logs` errors out | that target needs AWS CLI v2, half the team is on v1 | use `make payload`; or `make setup-awscli` |
 | Actions run, no PR | workflow is checking out the wrong repo | see `decisions.md` §6 — the culprit lives in `Tehreem404/bad_app_demo` |
 | alarm will not re-fire | it is still in ALARM from the last run | wait for OK; a state *transition* is what dispatches |
 
